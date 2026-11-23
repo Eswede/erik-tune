@@ -864,8 +864,9 @@ TOPICS_T = """
 <label><input type="checkbox" name="showall" {{ allsel }}>
 Visa även HA-discovery, egna erik-tune och systemtopics</label>
 <button>Filtrera</button></form>
-<p class="muted">{{ n }} topics visas (ur {{ total }} sedda; listan toppas vid
-max 200). Retained-meddelanden syns direkt efter anslutning.
+<p class="muted">{{ n }} rader visas på sidan (av {{ total }} filtrerade;
+{{ seen_total }} topics sedda totalt; sortering: senast sedd först).
+Retained-meddelanden syns direkt efter anslutning.
 JSON-topics (t.ex. wmbus-mätare) listas per nyckel: raden
 <code>fjv/kamstrup/values ◆ temp1</code> kopplar rollen till
 <code>fjv/kamstrup/values|temp1</code>.</p>
@@ -880,17 +881,18 @@ JSON-topics (t.ex. wmbus-mätare) listas per nyckel: raden
 <button>Använd</button></form></td></tr>
 {% endfor %}
 </table>
+{{ pager }}
 <p><a href="/setup">&laquo; Tillbaka till konfigureringen</a></p>
 """
 
 
 @app.get("/topics", response_class=HTMLResponse)
-def topics(q: str = "", showall: str = ""):
+def topics(q: str = "", showall: str = "", page: int = 1):
     """Topicutforskare: se allt som publiceras, filtrera, koppla till roll."""
     with _lock:
         items = list(_seen.items())
     items.sort(key=lambda kv: kv[1]["ts"], reverse=True)
-    total = len(items)
+    seen_total = len(items)
     if not showall:
         items = [(t, d) for t, d in items if not (
             t.startswith("homeassistant/") and t.endswith("/config"))
@@ -898,28 +900,56 @@ def topics(q: str = "", showall: str = ""):
             and not t.startswith("$")]
     qf = (q or "").strip().lower()
     if qf:
-        items = [(t, d) for t, d in items
-                 if qf in t.lower() or qf in d["payload"].lower()]
-    rows = []
-    for t, d in items[:200]:
+        def _hit(t, d):
+            if qf in t.lower() or qf in d["payload"].lower():
+                return True
+            for k, v in (d.get("fields") or {}).items():
+                if qf in k.lower() or qf in str(v).lower():
+                    return True   # sök även på JSON-nyckel/värde
+            return False
+        items = [(t, d) for t, d in items if _hit(t, d)]
+    all_rows = []
+    for t, d in items:      # ALLA filtrerade topics, ingen 200-topp
         fields = d.get("fields") or {}
         if not showall:    # brus som rssi/battery doljs; "visa alla" tar fram allt
             fields = {k: v for k, v in fields.items()
                       if k not in _NOISE_KEYS}
         if fields:   # JSON-topic: en rad per nyckel = valbara direkt
             for k in sorted(fields):
-                rows.append({"topic": f"{t} ◆ {k}",
-                             "payload": str(fields[k]),
-                             "age": fmt_age(d["ts"]),
-                             "assign": f"{t}|{k}"})
+                all_rows.append({"topic": f"{t} ◆ {k}",
+                                 "payload": str(fields[k]),
+                                 "age": fmt_age(d["ts"]),
+                                 "assign": f"{t}|{k}"})
         else:
-            rows.append({"topic": t, "payload": d["payload"],
-                         "age": fmt_age(d["ts"]), "assign": t})
+            rows_ = {"topic": t, "payload": d["payload"],
+                    "age": fmt_age(d["ts"]), "assign": t}
+            all_rows.append(rows_)
+    PAGE = 250
+    n_pages = (len(all_rows) + PAGE - 1) // PAGE
+    page = max(1, min(page, n_pages or 1))
+    rows = all_rows[(page - 1) * PAGE: page * PAGE]
+
+    def _link(p):
+        params = {}
+        if q:
+            params["q"] = q
+        if showall:
+            params["showall"] = "1"
+        params["page"] = str(p)
+        return f'<a href="/topics?{urllib.parse.urlencode(params)}">{p}</a>'
+
+    if n_pages > 1:
+        parts = [f"<strong>{p}</strong>" if p == page else _link(p)
+                 for p in range(1, n_pages + 1)]
+        pager = '<p class="muted">Sida: ' + " ".join(parts) + "</p>"
+    else:
+        pager = ""
     role_opts = "".join(f'<option value="{r}">{r}</option>' for r in ROLES)
     return render(TOPICS_T, rows=rows, q=q or "",
                   role_opts=role_opts,
                   allsel="checked" if showall else "",
-                  n=len(rows), total=total)
+                  n=len(rows), total=len(all_rows),
+                  seen_total=seen_total, pager=pager)
 
 
 @app.post("/topics/use")
