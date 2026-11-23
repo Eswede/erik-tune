@@ -70,7 +70,7 @@ ROLES = {
 
 DEFAULT_CONFIG = {
     "mqtt": {"host": "", "port": 1883, "user": "", "pass": "",
-             "client_id": "erik-tune"},
+             "client_id": "erik-tune", "explorer": "on"},
     "location": {"lat": 60.4858, "lon": 15.4342, "tz": "Europe/Stockholm",
                  "place": "Borlänge (default)"},
     "topics": {role: "" for role in ROLES},
@@ -159,6 +159,20 @@ def read_series(key: str, seconds: int):
 # --------------------------------------------------------------------------
 
 _topic_to_role: dict = {}
+_seen: dict = {}  # topic -> {"payload": str,"ts": float}: topicutforskaren
+
+
+def record_seen(msg) -> None:
+    """Minnestabell över allt som publicerats (topicutforskaren i webb-UI:t)."""
+    try:
+        payload = msg.payload.decode("utf-8", "replace")[:80]
+    except Exception:
+        payload = ""
+    with _lock:
+        _seen[msg.topic] = {"payload": payload, "ts": time.time()}
+        if len(_seen) > 3000:  # kapa: släpp de äldsta
+            for t in sorted(_seen, key=lambda k: _seen[k]["ts"])[:1000]:
+                del _seen[t]
 
 
 def parse_value(payload: bytes):
@@ -234,6 +248,8 @@ def on_connect(client, userdata, flags, reason_code, properties):
             _state["mqtt_connected"] = True
             _state["mqtt_error"] = ""
         client.subscribe("erik-tune/cmd/#", qos=1)
+        if CONFIG["mqtt"].get("explorer", "on") == "on":
+            client.subscribe("#", qos=0)  # topicutforskaren: se allt på busen
         for role, topic in CONFIG["topics"].items():
             if topic:
                 client.subscribe(topic, qos=1)
@@ -251,9 +267,10 @@ def on_disconnect(client, userdata, flags, reason_code, properties):
 
 
 def on_message(client, userdata, msg):
-    role = _topic_to_role.get(msg.topic)
-    if not role:
+    if msg.topic not in _topic_to_role:
+        record_seen(msg)      # topicutforskaren: minnestabell över alla topics
         return
+    role = _topic_to_role.get(msg.topic)
     val = parse_value(msg.payload)
     if val is None:
         return
@@ -502,6 +519,7 @@ BASE_T = """<!doctype html><html><head><meta charset="utf-8">
 <title>Erik Tune</title><style>{{ css }}</style></head><body>
 <header><h1>Erik Tune <span class="muted">egen värmestyrning</span></h1>
 <nav><a href="/">Dashboard</a><a href="/setup">MQTT &amp; topics</a>
+<a href="/topics">Topicutforskaren</a>
 <a href="/tuning">Tuning</a></nav></header>{{ body }}</body></html>"""
 
 DASH_T = """
@@ -550,6 +568,11 @@ gårdsprognos (microklimat, höjd över havet).</p>
 <label>Port</label><input name="port" value="{{cfg['mqtt']['port']}}">
 <label>Användare (frivilligt)</label><input name="user" value="{{cfg['mqtt']['user']}}">
 <label>Lösenord (frivilligt)</label><input name="passw" type="password" value="{{cfg['mqtt']['pass']}}">
+<label>Topicutforskare (prenumerera på alla topics)</label>
+<select name="explorer">
+ <option value="on" {{ex1}}>on: listar allt som publiceras under /topics</option>
+ <option value="off" {{ex2}}>off: prenumererar bara på rollerna</option>
+</select>
 <h2>Fine-position väder-API (fylls även i av ort-sökningen ovan)</h2>
 <label>Latitud</label><input name="lat" value="{{cfg['location']['lat']}}">
 <label>Longitud</label><input name="lon" value="{{cfg['location']['lon']}}">
@@ -562,6 +585,19 @@ gårdsprognos (microklimat, höjd över havet).</p>
    placeholder="t.ex. homeassistant/sensor/namn/state"></td></tr>{% endfor %}
 </table>
 <button>Spara</button></form>
+<h2>Topics på brokern</h2>
+<div class="card"><span>Sedda topics (senaste timmen, minnestabellen)</span>
+<span class="big">{{ n_seen }}</span></div>
+{% if seen_rows %}
+<table><tr><th>Senast sedd topic</th><th>Värde</th></tr>
+{% for r in seen_rows %}<tr>
+<td>{{r.topic}}<div class="muted">{{r.age}}</div></td>
+<td class="muted">{{r.payload}}</td></tr>{% endfor %}
+</table>
+{% endif %}
+<p><a href="/topics">Öppna topicutforskaren: lista allt som publiceras,
+sök på namn/värde och koppla en topic direkt till en roll - inga
+topic-namn att skriva utantill.</a></p>
 <p class="muted">Tips: HA-entiteter som inte redan finns på MQTT (SMHI-ute,
 köldfaktorn, Tado) streamas enklast ut med en automation som gör
 <code>mqtt.publish</code> vid varje ändring – se README.</p>
@@ -689,8 +725,16 @@ def dashboard():
 
 @app.get("/setup", response_class=HTMLResponse)
 def setup_get():
+    with _lock:
+        seen = sorted(_seen.items(), key=lambda kv: kv[1]["ts"], reverse=True)
+    seen_rows = [{"topic": t, "payload": d["payload"][:40],
+                  "age": fmt_age(d["ts"])} for t, d in seen[:12]]
+    ex = CONFIG["mqtt"].get("explorer", "on")
     return render(SETUP_T, cfg=CONFIG, roles=ROLES,
-                  place=CONFIG["location"].get("place") or "inte valt")
+                  place=CONFIG["location"].get("place") or "inte valt",
+                  seen_rows=seen_rows, n_seen=len(seen),
+                  ex1="selected" if ex != "off" else "",
+                  ex2="selected" if ex == "off" else "")
 
 
 GEO_T = """
@@ -711,6 +755,67 @@ tätort.</p>{% endif %}
 
 GEO_URL = ("https://geocoding-api.open-meteo.com/v1/search"
            "?name={q}&count=8&language=sv&format=json")
+
+TOPICS_T = """
+<h2>Topics som publiceras på brokern</h2>
+<form method="get" action="/topics">
+<label>Filtrera (sök i topic-namn eller värde)</label>
+<input name="q" value="{{ q }}">
+<label><input type="checkbox" name="showall" {{ allsel }}>
+Visa även HA-discovery, egna erik-tune och systemtopics</label>
+<button>Filtrera</button></form>
+<p class="muted">{{ n }} topics visas (ur {{ total }} sedda; listan toppas vid
+max 200). Retained-meddelanden syns direkt efter anslutning.</p>
+<table><tr><th>Topic</th><th>Senaste värde</th><th>Senast</th>
+<th>Koppla till roll</th></tr>
+{% for r in rows %}
+<tr><td>{{r.topic}}</td><td class="muted">{{r.payload}}</td>
+<td class="muted">{{r.age}}</td><td>
+<form method="post" action="/topics/use">
+<input type="hidden" name="topic" value="{{r.topic}}">
+<select name="role">{{role_opts}}</select>
+<button>Använd</button></form></td></tr>
+{% endfor %}
+</table>
+<p><a href="/setup">&laquo; Tillbaka till konfigureringen</a></p>
+"""
+
+
+@app.get("/topics", response_class=HTMLResponse)
+def topics(q: str = "", showall: str = ""):
+    """Topicutforskare: se allt som publiceras, filtrera, koppla till roll."""
+    with _lock:
+        items = list(_seen.items())
+    items.sort(key=lambda kv: kv[1]["ts"], reverse=True)
+    total = len(items)
+    if not showall:
+        items = [(t, d) for t, d in items if not (
+            t.startswith("homeassistant/") and t.endswith("/config"))
+            and not t.startswith("erik-tune/")
+            and not t.startswith("$")]
+    qf = (q or "").strip().lower()
+    if qf:
+        items = [(t, d) for t, d in items
+                 if qf in t.lower() or qf in d["payload"].lower()]
+    rows = [{"topic": t, "payload": d["payload"], "age": fmt_age(d["ts"])}
+            for t, d in items[:200]]
+    role_opts = "".join(f'<option value="{r}">{r}</option>' for r in ROLES)
+    return render(TOPICS_T, rows=rows, q=q or "",
+                  role_opts=role_opts,
+                  allsel="checked" if showall else "",
+                  n=len(rows), total=total)
+
+
+@app.post("/topics/use")
+async def topics_use(request: Request):
+    """Koppla en sedd topic till en roll (från topicutforskaren)."""
+    f = await request.form()
+    role, topic = f.get("role", ""), f.get("topic", "").strip()
+    if role in ROLES and topic:
+        CONFIG["topics"][role] = topic
+        save_config(CONFIG)
+        _mqtt_rebuild.set()  # prenumerera om med den nya rollkopplingen
+    return RedirectResponse("/setup", status_code=303)
 
 
 @app.get("/geo/search", response_class=HTMLResponse)
@@ -763,6 +868,10 @@ async def setup_post(request: Request):
     global CONFIG
     f = await request.form()
     mqtt_changed = _form_to_config_ports(f)
+    ex = "off" if f.get("explorer") == "off" else "on"
+    if ex != CONFIG["mqtt"].get("explorer", "on"):
+        CONFIG["mqtt"]["explorer"] = ex
+        mqtt_changed = True
     try:
         CONFIG["location"]["lat"] = float(f.get("lat"))
         CONFIG["location"]["lon"] = float(f.get("lon"))
