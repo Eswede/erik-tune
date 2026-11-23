@@ -189,7 +189,11 @@ _NOISE_KEYS = {"rssi", "linkquality", "lqi", "battery", "voltage",
 
 def record_seen(msg) -> None:
     """Minnestabell över allt som publicerats (topicutforskaren i webb-UI:t).
-    JSON-objekt med numeriska värden bryts ut per nyckel i 'fields'."""
+    JSON-objekt med numeriska värden bryts ut per nyckel i 'fields'.
+    Eget/styrtopic (erik-tune/) loggas inte: det ar bokföring av egna
+    utmatningar, inte ingangar."""
+    if msg.topic.startswith("erik-tune/"):
+        return
     try:
         payload = msg.payload.decode("utf-8", "replace")[:80]
     except Exception:
@@ -388,9 +392,9 @@ def on_message(client, userdata, msg):
     if msg.topic.startswith("erik-tune/cmd/"):
         handle_cmd(client, msg)  # kommandon från HA (setpoint, mode)
         return
+    record_seen(msg)          # minnestabellen: ALLA topics, aven rollkopplade
     roles = _topic_to_role.get(msg.topic)
     if not roles:
-        record_seen(msg)      # topicutforskaren: minnestabell över alla topics
         return
     for role in list(roles):  # en topic kan mata flera roller (t1_c + t2_c)
         val = parse_value(msg.payload, _role_json_key.get(role) or None)
@@ -861,6 +865,27 @@ def fmt_age(ts):
     return f"{s//60} min" if s < 3600 else f"{s//3600} h"
 
 
+def topic_diag(spec):
+    """Diagnos-HTML for en rollkoppling utan friskt sample: talar om
+    om topiken pratar pa busen och om JSON-nyckeln finns. Syns pa
+    dashboardens ingangstabell sa fel kopplingar syns direkt."""
+    if not spec:
+        return ""
+    base, _, key = spec.partition("|")
+    with _lock:
+        seen = _seen.get(base)
+        fields = {k: v for k, v in (seen.get("fields") or {}).items()
+                  if k not in _NOISE_KEYS} if seen else None
+    if not seen:
+        return ' <span class="warn">topic aldrig sedd sedan start</span>'
+    out = f' <span class="warn">sedd {fmt_age(seen["ts"])} sedan</span>'
+    if key and key not in (fields or {}):
+        ks = ", ".join(list(fields)[:6]) if fields else "inga num. nycklar"
+        out += (f' <span class="warn">nyckeln {key} saknas!'
+                f' finns: {ks}</span>')
+    return out
+
+
 def spark_svg():
     def path_for(key, color):
         pts = read_series(key, 86400)
@@ -897,11 +922,14 @@ def dashboard():
     rows = []
     for role in ROLES:
         rec = s.get(role)
+        spec = CONFIG["topics"][role] or ""
+        stale = (not rec) or (time.time() - rec["ts"] > 1800)
         rows.append({
             "role": role,
             "val": f"{rec['value']:.2f}" if rec else "-",
             "age": fmt_age(rec["ts"]) if rec else "-",
-            "topic": rec["topic"] if rec else (CONFIG["topics"][role] or "-"),
+            "topic": ((rec["topic"] if rec else (spec or "-"))
+                      + (topic_diag(spec) if stale else "")),
         })
 
     forecast_svg = ""
