@@ -85,6 +85,28 @@ DEFAULT_CONFIG = {
     },
     "weather": {"poll_interval_s": 1800},
     "publish": {"inject": "on", "discovery": "on"},
+    "auto": {
+        "enabled": "off",        # självlärande rumsreglering (är/bör)
+        "setpoint_c": 21.0,      # Bör-värde: mål-rumstemperatur
+        "k_p": 0.5,              # grader korrigering per grad fel (P-ledet)
+        "learn_rate": 0.05,      # band-minnets steg per lärtillfälle (I-ledet)
+        "learn_interval_s": 900, # lär max var 15 min: huset svarar i timmar
+        "deadband_c": 0.3,       # fält inom dödbandet: inget nytt lärande
+        "avg_window_s": 1800,    # fültret: medel av rumstemp senaste 30 min
+        "band_size": 5,          # köldfaktorbandens bredd, °C
+        "power_gain": 0.5,       # grader inject per kW effectgap (snabb innerslinga)
+        "power_max_age_s": 900,  # effectvandet far vara max 15 min gammalt
+        # Frö fran arsdata (5 552 h dec25-nov26, Tin ~21.4 C): matad effekt
+        # per koldfaktorband, justerat ~+2.5 C (kold ar vindkylt vs ute),
+        # inkl varmvatten ~1.2 kW golfloor. EMA (0.9/0.1) ratter till
+        # verkliga vardet inom nagra dagar; band utan frö lar fran nuvarande.
+        "p_bal": {"25": 1.2, "20": 1.2, "15": 1.1, "10": 1.3, "5": 1.6,
+                  "0": 2.2, "-5": 3.3, "-10": 4.6, "-15": 5.5, "-20": 5.9,
+                  "-25": 7.0},   # band -> balanserad effekt (kW)
+        "max_correction_c": 3.0,
+        "sample_max_age_s": 1800,
+        "bands": {},             # minnet: börvärde-for-skewing: band -> korrigering
+    },
 }
 
 
@@ -281,6 +303,15 @@ def publish_discovery(client):
     }
     client.publish("homeassistant/number/erik_tune_offset/config",
                    json.dumps(num), retain=True, qos=1)
+    # Number-entitet: Bör-värdet (mål-rumstemperatur), styrbar från HA
+    num2 = dict(num)
+    num2.update({"name": "Erik Tune Börvärde",
+                 "unique_id": "erik_tune_borvarde",
+                 "min": 10.0, "max": 30.0, "step": 0.5,
+                 "state_topic": "erik-tune/setpoint/c",
+                 "command_topic": "erik-tune/cmd/setpoint"})
+    client.publish("homeassistant/number/erik_tune_borvarde/config",
+                   json.dumps(num2), retain=True, qos=1)
 
 
 def handle_cmd(client, msg) -> None:
@@ -297,6 +328,14 @@ def handle_cmd(client, msg) -> None:
     elif sub == "mode" and payload in ("shadow", "active"):
         CONFIG["injector"]["mode"] = payload
         changed = True
+    elif sub == "setpoint":
+        try:
+            v = round(float(payload), 1)
+            if 5 <= v <= 30:
+                CONFIG["auto"]["setpoint_c"] = v
+                changed = True
+        except ValueError:
+            pass
     if changed:
         save_config(CONFIG)
         publish_state(client)
@@ -311,6 +350,8 @@ def publish_state(client=None) -> None:
     client.publish("erik-tune/offset/c", CONFIG["injector"]["offset_c"],
                    retain=True, qos=1)
     client.publish("erik-tune/mode", CONFIG["injector"]["mode"],
+                   retain=True, qos=1)
+    client.publish("erik-tune/setpoint/c", CONFIG["auto"]["setpoint_c"],
                    retain=True, qos=1)
 
 
@@ -544,10 +585,84 @@ def compute_inject():
     return round(inject, 2), round(inject - ute, 2)
 
 
+def auto_regulate():
+    """Självlärande rumsreglering (är/bör): P-led på felet + minne per
+    köldfaktorband. Returnerar reglerdata eller None (av / inga friska data)."""
+    a = CONFIG["auto"]
+    if a.get("enabled") != "on":
+        return None
+    rec = _state["samples"].get("indoor_temp_c")
+    if not rec or time.time() - rec["ts"] > int(a["sample_max_age_s"]):
+        return None
+    w = _state["weather"] or {}
+    kold = w.get("koldfaktor_c")
+    if kold is None:
+        kold = w.get("temp_c")   # fallbak: prognostemperatur som bandindex
+    if kold is None:
+        return None
+    # Hutrigt system: fültret felet pa 30-minursmedel av rumstempen,
+    # inte pa momentanvarden (dorr, spis, sol...)
+    pts = read_series("ar_c", int(a["avg_window_s"]))
+    if len(pts) >= 10:
+        ar = sum(p[1] for p in pts) / len(pts)
+    else:
+        ar = rec["value"]       # uppstart: ingen historik än
+    bor = float(a["setpoint_c"])
+    err = bor - ar
+    band = int(kold // int(a["band_size"])) * int(a["band_size"])
+    bias = float(a["bands"].get(str(band), 0.0))
+    mx = float(a["max_correction_c"])
+
+    # Innerslinga: effekt (kW) ar mycket snabbare an rumstempen (minuter
+    # mot timmar). Nar huset ligger ratt lars vi bandets balanseffekt;
+    # nar det avviker drever effektgapet inject direkt.
+    pw, corr_p = None, 0.0
+    prec2 = _state["samples"].get("fjv_power_kw")
+    if (prec2 and time.time() - prec2["ts"] <= int(a["power_max_age_s"])
+            and float(a["power_gain"]) > 0):
+        pw = prec2["value"]
+        key = str(band)
+        if abs(err) <= float(a["deadband_c"]):
+            old = float(a["p_bal"].get(key, pw))
+            a["p_bal"][key] = round(old * 0.9 + pw * 0.1, 3)  # EMA
+        elif key in a["p_bal"]:
+            corr_p = max(-mx, min(mx,
+                float(a["power_gain"]) * (float(a["p_bal"][key]) - pw)))
+
+    if abs(err) <= float(a["deadband_c"]):
+        return {"err": 0.0, "corr": round(bias, 2), "band": band,
+                "ar_c": round(ar, 2), "bor_c": bor, "pw": pw,
+                "bias": round(bias, 3), "hold": True}   # dödband: hall minnet
+    corr = max(-mx, min(mx, bias + float(a["k_p"]) * err + corr_p))
+    new_bias = bias
+    if time.time() - _state.get("last_learn", 0) >= int(a["learn_interval_s"]):
+        new_bias = max(-mx, min(mx, bias + float(a["learn_rate"]) * err))
+        a["bands"][str(band)] = round(new_bias, 3)
+        _state["last_learn"] = time.time()   # lam/lar husvis: max var 15 min
+    return {"err": round(err, 2), "corr": round(corr, 2), "band": band,
+            "ar_c": round(ar, 2), "bor_c": bor, "bias": round(new_bias, 3),
+            "pw": pw, "corr_p": round(corr_p, 2)}
+
+
 def control_loop():
     while True:
         try:
             inject_c, influence_c = compute_inject()
+            reg = auto_regulate()
+            if inject_c is not None and reg is not None:
+                inject_c = round(max(float(CONFIG["injector"]["min_inject_c"]),
+                    min(float(CONFIG["injector"]["max_inject_c"]),
+                        inject_c + reg["corr"])), 2)
+                influence_c = round(influence_c + reg["corr"], 2)
+                client.publish("erik-tune/room/ar_c", reg["ar_c"],
+                               retain=True, qos=1)
+                client.publish("erik-tune/room/bor_c", reg["bor_c"],
+                               retain=True, qos=1)
+                log_sample("ar_c", reg["ar_c"])
+                log_sample("err_c", reg["err"])
+                save_config(CONFIG)   # regulatorns minne består omstarten
+                with _lock:
+                    _state["last_reg"] = reg
             if inject_c is not None:
                 with _lock:
                     _state["inject_c"] = inject_c
@@ -630,6 +745,17 @@ DASH_T = """
 {% for r in rows %}<tr><td>{{r.role}}</td><td>{{r.val}}</td>
 <td class="muted">{{r.age}}</td><td class="muted">{{r.topic}}</td></tr>{% endfor %}
 </table>
+
+<h2>Rumsreglering: är/bör</h2>
+<div class="card"><span>Är-värde (rumstemperatur)</span><span class="big">{{ ar }} °C</span></div>
+<div class="card"><span>Bör-värde (mål rumstemperatur)</span>
+<form method="post" action="/setpoint">
+<input name="v" type="number" step="0.5" value="{{ bor }}" style="max-width:110px">
+<button>Spara</button></form></div>
+<div class="card {{ 'ok' if auto_on else 'warn' }}">
+<span>Självlärande reglering {{ 'PÅ' if auto_on else 'AV' }}</span>
+<form method="post" action="/auto"><button>{{ 'Stäng av' if auto_on else 'Slå på' }}</button></form></div>
+{{ learn_table }}
 
 <h2>Väder, {{ place }} (Open-Meteo, lat {{lat}} lon {{lon}})</h2>
 <div class="card"><span>Ute / Köldfaktor</span><span class="big">{{ w_temp }} / {{ w_kold }} °C</span></div>
@@ -791,6 +917,26 @@ def dashboard():
                         '<polyline fill="none" stroke="#8ab4e8" stroke-width="2"'
                         f' points="{coords}"/></svg></div>')
 
+    a = CONFIG["auto"]
+    rec = _state["samples"].get("indoor_temp_c")
+    ar = f"{rec['value']:.1f}" if rec else "-"
+    learn_rows = ""
+    for bd, v in sorted(((int(k), val) for k, val in a["bands"].items()),
+                        reverse=True)[:12]:
+        learn_rows += (f"<tr><td>{bd} … {bd + int(a['band_size'])} °C"
+                       f" köldfaktor</td><td>{v:+.2f} °C</td></tr>")
+    learn_table = ""
+    if learn_rows:
+        learn_table = ("<h2>Regulatorns minne (inlärd korrigering per"
+                       " köldfaktorband)</h2><table><tr><th>Band</th>"
+                       f"<th>Korrigering</th></tr>{learn_rows}</table>")
+    if _state.get("last_reg"):
+        lg = _state["last_reg"]
+        learn_table += (f'<p class="muted">Senaste reglering: fel {lg["err"]} °C'
+                        f', korrigering {lg["corr"]} °C, band {lg["band"]}'
+                        + (f', effekt {lg["pw"]} kW' if lg.get("pw") is not None else '')
+                        + '.</p>')
+
     return render(DASH_T, dash=True,
         mqtt_ok=_state["mqtt_connected"],
         host=CONFIG["mqtt"]["host"] or "-",
@@ -813,7 +959,9 @@ def dashboard():
         w_fk=((w or {}).get("forecast_koldfaktor_c", "-")),
         w_kold_drop=((w or {}).get("koldfaktor_drop_c", "-")),
         pre_h=CONFIG["injector"]["pre_hours"],
-        spark=spark_svg(), w_forecast_svg=forecast_svg)
+        spark=spark_svg(), w_forecast_svg=forecast_svg,
+        ar=ar, bor=a["setpoint_c"],
+        auto_on=(a.get("enabled") == "on"), learn_table=learn_table)
 
 
 @app.get("/setup", response_class=HTMLResponse)
@@ -1073,6 +1221,30 @@ async def offset_post(request: Request):
             publish_state()
     except (TypeError, ValueError):
         pass  # ogiltig inmatning ignoreras, värdet behålls
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/setpoint")
+async def setpoint_post(request: Request):
+    """Bör-värde (mål rumstemperatur) från dashboarden."""
+    f = await request.form()
+    try:
+        v = round(float(f.get("v")), 1)
+        if 5 <= v <= 30:
+            CONFIG["auto"]["setpoint_c"] = v
+            save_config(CONFIG)
+            publish_state()
+    except (TypeError, ValueError):
+        pass
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/auto")
+async def auto_post():
+    """Slå på/av självlärande rumsreglering."""
+    CONFIG["auto"]["enabled"] = (
+        "off" if CONFIG["auto"].get("enabled") == "on" else "on")
+    save_config(CONFIG)
     return RedirectResponse("/", status_code=303)
 
 
