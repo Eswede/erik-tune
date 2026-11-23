@@ -1,1 +1,21 @@
+# Stream Home Assistant entities that lack an MQTT topic onto the bus,
+# so Erik Tune can subscribe to them.
+#
+# Adjust the entity_id list to your own sensors (weather integration,
+# template sensors, radiator thermostats, ...). retain: true gives
+# Erik Tune the latest values immediately after its own restart.
+automation:
+  - alias: "Stream HA sensors to MQTT (for Erik Tune)"
+    trigger:
+        - platform: state
+          entity_id:
+            - sensor.outdoor_temperature
+            - sensor.wind_chill
+            - sensor.living_room_temperature
+      action:
+        - service: mqtt.publish
+          data:
+            topic: "homeassistant/sensor/{{ trigger.entity_id.split('.')[1] }}/state"
+            payload: "{{ states(trigger.entity_id) }}"
+            retain: true
 
