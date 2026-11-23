@@ -158,9 +158,11 @@ def read_series(key: str, seconds: int):
 # MQTT
 # --------------------------------------------------------------------------
 
-_topic_to_role: dict = {}
+_topic_to_role: dict = {}    # base-topic -> lista av roller (en topic kan mata flera)
 _role_json_key: dict = {}   # roll -> JSON-nyckel (t.ex. 'temp1'), "" = hela payload
 _seen: dict = {}  # topic -> {"payload","ts","fields"}: topicutforskaren
+_NOISE_KEYS = {"rssi", "linkquality", "lqi", "battery", "voltage",
+               "last_seen", "elapsed", "strength"}  # husgerad, inte mätvärden
 
 
 def record_seen(msg) -> None:
@@ -174,8 +176,14 @@ def record_seen(msg) -> None:
     try:
         obj = json.loads(msg.payload)
         if isinstance(obj, dict):
-            fields = {k: v for k, v in obj.items()
-                      if isinstance(v, (int, float))}
+            for k, v in obj.items():
+                if isinstance(v, (int, float)):
+                    fields[k] = v
+                elif isinstance(v, str):
+                    try:
+                        fields[k] = float(v)  # siffror som strängar
+                    except ValueError:
+                        pass
     except (TypeError, ValueError):
         pass
     with _lock:
@@ -202,13 +210,18 @@ def parse_value(payload: bytes, key: str = None):
             v = obj.get(key)
             if isinstance(v, (int, float)):
                 return float(v)
+            if isinstance(v, str):
+                try:
+                    return float(v)   # "72.18" som sträng i JSON
+                except ValueError:
+                    return None
             return None
         for k in ("state", "value", "temperature"):
             if k in obj and isinstance(obj[k], (int, float)):
                 return float(obj[k])
-        for v in obj.values():
-            if isinstance(v, (int, float)):
-                return float(v)
+        for k, v in obj.items():
+            if k not in _NOISE_KEYS and isinstance(v, (int, float)):
+                return float(v)  # ratt matvarde, inte rssi/battery/linkquality
     if isinstance(obj, (int, float)):
         return float(obj)
     return None
@@ -256,6 +269,49 @@ def publish_discovery(client):
             cfg.pop("device_class", None)
         client.publish(f"{pre}/{uid}/config", json.dumps(cfg),
                        retain=True, qos=1)
+    # Number-entitet: HA-slider som sätter offset (Påverkan) via MQTT
+    num = {
+        "name": "Erik Tune Påverkan", "unique_id": "erik_tune_offset",
+        "state_topic": "erik-tune/offset/c",
+        "command_topic": "erik-tune/cmd/offset",
+        "min": -10.0, "max": 10.0, "step": 0.1, "mode": "slider",
+        "unit_of_measurement": "°C",
+        "device": {"identifiers": ["erik-tune"], "name": "Erik Tune",
+                   "model": "Egen Tune-kopia", "manufacturer": "Erik Olsson"},
+    }
+    client.publish("homeassistant/number/erik_tune_offset/config",
+                   json.dumps(num), retain=True, qos=1)
+
+
+def handle_cmd(client, msg) -> None:
+    """MQTT-kommandon (t.ex. från HA): cmd/offset <- tal, cmd/mode <- shadow|active."""
+    payload = msg.payload.decode("utf-8", "replace").strip()
+    sub = msg.topic[len("erik-tune/cmd/"):]
+    changed = False
+    if sub == "offset":
+        try:
+            CONFIG["injector"]["offset_c"] = round(float(payload), 2)
+            changed = True
+        except ValueError:
+            pass
+    elif sub == "mode" and payload in ("shadow", "active"):
+        CONFIG["injector"]["mode"] = payload
+        changed = True
+    if changed:
+        save_config(CONFIG)
+        publish_state(client)
+
+
+def publish_state(client=None) -> None:
+    """Offset + mode som retained state, så HA-slidern dashboarden hänger med."""
+    if client is None:
+        client = globals().get("client")
+    if client is None:
+        return
+    client.publish("erik-tune/offset/c", CONFIG["injector"]["offset_c"],
+                   retain=True, qos=1)
+    client.publish("erik-tune/mode", CONFIG["injector"]["mode"],
+                   retain=True, qos=1)
 
 
 def on_connect(client, userdata, flags, reason_code, properties):
@@ -271,7 +327,9 @@ def on_connect(client, userdata, flags, reason_code, properties):
             if spec:
                 base, _, key = spec.partition("|")  # topic|json-nyckel
                 client.subscribe(base, qos=1)
-                _topic_to_role[base] = role
+                lst = _topic_to_role.setdefault(base, [])
+                if role not in lst:      # samma topic kan mata flera roller
+                    lst.append(role)
                 _role_json_key[role] = key or ""
         publish_discovery(client)
     else:
@@ -286,16 +344,20 @@ def on_disconnect(client, userdata, flags, reason_code, properties):
 
 
 def on_message(client, userdata, msg):
-    if msg.topic not in _topic_to_role:
+    if msg.topic.startswith("erik-tune/cmd/"):
+        handle_cmd(client, msg)  # kommandon från HA (setpoint, mode)
+        return
+    roles = _topic_to_role.get(msg.topic)
+    if not roles:
         record_seen(msg)      # topicutforskaren: minnestabell över alla topics
         return
-    role = _topic_to_role.get(msg.topic)
-    val = parse_value(msg.payload, _role_json_key.get(role) or None)
-    if val is None:
-        return
-    with _lock:
-        _state["samples"][role] = {"ts": time.time(), "value": val,
-                                   "topic": msg.topic}
+    for role in list(roles):  # en topic kan mata flera roller (t1_c + t2_c)
+        val = parse_value(msg.payload, _role_json_key.get(role) or None)
+        if val is None:
+            continue
+        with _lock:
+            _state["samples"][role] = {"ts": time.time(), "value": val,
+                                       "topic": msg.topic}
 
 
 def build_client():
@@ -498,6 +560,9 @@ def control_loop():
                                    retain=True, qos=1)
                 client.publish("erik-tune/mode", CONFIG["injector"]["mode"],
                                retain=True, qos=1)
+                client.publish("erik-tune/offset/c",
+                               CONFIG["injector"]["offset_c"],
+                               retain=True, qos=1)
                 log_sample("inject_c", inject_c)
                 log_sample("influence_c", influence_c)
             for role in ROLES:
@@ -553,6 +618,10 @@ DASH_T = """
 <h2>Vår styrning</h2>
 <div class="card"><span>Inject (fejkad utetemp)</span><span class="big">{{ inject }} °C</span></div>
 <div class="card"><span>Influence (vår Påverkan)</span><span class="big">{{ influence }} °C</span></div>
+<div class="card"><span>Justera Påverkan (offset_c) direkt</span>
+<form method="post" action="/offset">
+<input name="v" type="number" step="0.5" value="{{ off }}" style="max-width:110px">
+<button>Spara</button></form></div>
 <div class="card"><span>Verklig utetemp (MQTT, annars prognos)</span><span class="big">{{ ute }} °C</span></div>
 {{ spark }}
 
@@ -731,6 +800,7 @@ def dashboard():
         last_weather=(f"senast {fmt_age(_state['last_weather_ok'])}"
                       if _state["last_weather_ok"] else "väntar på svar"),
         inject=_state["inject_c"], influence=_state["influence_c"],
+        off=CONFIG["injector"]["offset_c"],
         ute=current_ute(), rows=rows,
         lat=CONFIG["location"]["lat"], lon=CONFIG["location"]["lon"],
         w_temp=((w or {}).get("temp_c", "-")),
@@ -753,6 +823,7 @@ def setup_get():
     def _disp(d):
         f = d.get("fields")
         if f:
+            f = {k: v for k, v in f.items() if k not in _NOISE_KEYS}
             return " ".join(f"{k}={v}" for k, v in list(f.items())[:5])
         return d["payload"][:40]
 
@@ -831,10 +902,14 @@ def topics(q: str = "", showall: str = ""):
                  if qf in t.lower() or qf in d["payload"].lower()]
     rows = []
     for t, d in items[:200]:
-        if d.get("fields"):   # JSON-topic: en rad per nyckel = valbara direkt
-            for k in sorted(d["fields"]):
+        fields = d.get("fields") or {}
+        if not showall:    # brus som rssi/battery doljs; "visa alla" tar fram allt
+            fields = {k: v for k, v in fields.items()
+                      if k not in _NOISE_KEYS}
+        if fields:   # JSON-topic: en rad per nyckel = valbara direkt
+            for k in sorted(fields):
                 rows.append({"topic": f"{t} ◆ {k}",
-                             "payload": str(d["fields"][k]),
+                             "payload": str(fields[k]),
                              "age": fmt_age(d["ts"]),
                              "assign": f"{t}|{k}"})
         else:
@@ -953,6 +1028,21 @@ async def tune_post(request: Request):
         pass
     CONFIG["publish"]["inject"] = "off" if f.get("pub") == "off" else "on"
     save_config(CONFIG)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/offset")
+async def offset_post(request: Request):
+    """Snabbjustering av Påverkan från dashboarden (samma som HA-slidern)."""
+    f = await request.form()
+    try:
+        v = round(float(f.get("v")), 2)
+        if -30 <= v <= 30:
+            CONFIG["injector"]["offset_c"] = v
+            save_config(CONFIG)
+            publish_state()
+    except (TypeError, ValueError):
+        pass  # ogiltig inmatning ignoreras, värdet behålls
     return RedirectResponse("/", status_code=303)
 
 
