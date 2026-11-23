@@ -58,6 +58,22 @@ DATA.mkdir(parents=True, exist_ok=True)
 WEB_PORT = int(os.environ.get("ERIK_PORT", "8080"))
 CYCLE_S = 60  # injektionsberäkning/publicering/logging
 
+# ---- logg rakt till stdout: `docker logs erik-tune` -----------------------------
+_log_states: dict = {}    # nyckel -> senaste meddelandet (endast ändringar loggas)
+_log_first: set = set()  # roller som redan loggats första gången
+
+
+def log(msg: str) -> None:
+    """Tidsstämplad rad till stdout (python -u, docker logs)."""
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
+
+
+def log_change(key: str, msg: str) -> None:
+    """Logga bara om tillståndet ändrats sedan förra raden för nyckeln."""
+    if _log_states.get(key) != msg:
+        log(msg)
+        _log_states[key] = msg
+
 ROLES = {
     "ute_temp_c":        "Utetemperatur (verklig; kan med fördel hämtas från väder-APIt om topic saknas)",
     "indoor_temp_c":     "Rumstemperatur (valfri, för framtida komfortreglering)",
@@ -268,6 +284,7 @@ def discovery_cfg(unique_id, name, state_topic, uom, device_class=None):
 def publish_discovery(client):
     if CONFIG["publish"].get("discovery") != "on":
         return
+    ph = max(1, int(CONFIG["injector"].get("pre_hours", 6)))
     pre = "homeassistant/sensor"
     items = [
         ("erik_tune_inject_temp_c", "Erik Tune Injected Outdoor",
@@ -278,11 +295,17 @@ def publish_discovery(client):
          "erik-tune/koldfaktor/c", "°C", "temperature"),
         ("erik_tune_solar_wm2", "Erik Tune Solinstrålning",
          "erik-tune/solar/wm2", "W/m²", "irradiance"),
-        ("erik_tune_forecast_temp_c", "Erik Tune Prognostemp",
+        ("erik_tune_forecast_solar_wm2",
+         f"Erik Tune Solinstrålningprognos ({ph} h)",
+         "erik-tune/forecast/solar_wm2", "W/m²", "irradiance"),
+        ("erik_tune_forecast_temp_c",
+         f"Erik Tune Prognostemp ({ph} h)",
          "erik-tune/forecast/temp_c", "°C", "temperature"),
-        ("erik_tune_forecast_drop_c", "Erik Tune Prognosändring",
+        ("erik_tune_forecast_drop_c",
+         f"Erik Tune Prognosändring ({ph} h)",
          "erik-tune/forecast/drop_c", "°C", None),
-        ("erik_tune_forecast_koldfaktor_c", "Erik Tune Köldfaktorprognos",
+        ("erik_tune_forecast_koldfaktor_c",
+         f"Erik Tune Köldfaktorprognos ({ph} h)",
          "erik-tune/forecast/koldfaktor_c", "°C", "temperature"),
         ("erik_tune_mode", "Erik Tune Mode",
          "erik-tune/mode", None, None),
@@ -311,6 +334,7 @@ def publish_discovery(client):
     num2 = dict(num)
     num2.update({"name": "Erik Tune Börvärde",
                  "unique_id": "erik_tune_borvarde",
+                 "device_class": "temperature",
                  "min": 10.0, "max": 30.0, "step": 0.5,
                  "state_topic": "erik-tune/setpoint/c",
                  "command_topic": "erik-tune/cmd/setpoint"})
@@ -343,6 +367,7 @@ def handle_cmd(client, msg) -> None:
     if changed:
         save_config(CONFIG)
         publish_state(client)
+        log(f"MQTT-kommando: {sub} = {payload}")
 
 
 def publish_state(client=None) -> None:
@@ -377,15 +402,21 @@ def on_connect(client, userdata, flags, reason_code, properties):
                     lst.append(role)
                 _role_json_key[role] = key or ""
         publish_discovery(client)
+        n = sum(1 for s in CONFIG["topics"].values() if s)
+        log(f"MQTT ansluten {CONFIG['mqtt']['host']}:{CONFIG['mqtt']['port']}"
+            f" ({n} rollkopplingar, utforskare "
+            f"{'på' if CONFIG['mqtt'].get('explorer', 'on') == 'on' else 'av'})")
     else:
         with _lock:
             _state["mqtt_error"] = f"connect misslyckades: {reason_code}"
+        log_change("conn", f"MQTT connect misslyckades: {reason_code}")
 
 
 def on_disconnect(client, userdata, flags, reason_code, properties):
     with _lock:
         _state["mqtt_connected"] = False
         _state["mqtt_error"] = f"frånkopplad: {reason_code}"
+    log_change("disc", f"MQTT frånkopplad: {reason_code}")
 
 
 def on_message(client, userdata, msg):
@@ -403,6 +434,12 @@ def on_message(client, userdata, msg):
         with _lock:
             _state["samples"][role] = {"ts": time.time(), "value": val,
                                        "topic": msg.topic}
+        if role not in _log_first:
+            with _lock:
+                seen_before = role in _log_first
+                _log_first.add(role)
+            if not seen_before:
+                log(f"roll {role} = {val} ({msg.topic})   [första värdet]")
 
 
 def build_client():
@@ -430,6 +467,7 @@ def mqtt_manager():
     while True:
         if _mqtt_rebuild.is_set():
             _mqtt_rebuild.clear()
+            log("MQTT-klient byggs om (ny konfiguration)")
             try:
                 client.loop_stop()
                 client.disconnect()
@@ -449,6 +487,7 @@ def mqtt_manager():
             except Exception as exc:
                 with _lock:
                     _state["mqtt_error"] = f"connect-fel: {exc}"
+                log_change("conn", f"MQTT connect-fel: {exc}")
         time.sleep(5)
 
 
@@ -501,6 +540,7 @@ def poll_weather():
     drop = round(t_h - temp, 1)
     kold_h = kold_series[h_i]
     kold_drop = round(kold_h - kold, 1)
+    rad_h = h["shortwave_radiation"][h_i]    # sol pa samma horisont
 
     with _lock:
         _state["last_weather_ok"] = time.time()
@@ -508,7 +548,7 @@ def poll_weather():
             "ts": time.time(), "temp_c": temp, "wind_kmh": wind,
             "koldfaktor_c": kold, "solar_wm2": rad, "cloud_cover": cc,
             "forecast_temp_c": t_h, "forecast_drop_c": drop,
-            "forecast_koldfaktor_c": kold_h,
+            "forecast_koldfaktor_c": kold_h, "forecast_solar_wm2": rad_h,
             "koldfaktor_drop_c": kold_drop,
             "series": list(zip(times[idx:idx + 13], temps[idx:idx + 13])),
             "koldfaktor_series": list(zip(times[idx:idx + 13],
@@ -520,20 +560,26 @@ def poll_weather():
     client.publish("erik-tune/forecast/koldfaktor_c", kold_h,
                    retain=True, qos=1)
     client.publish("erik-tune/solar/wm2", round(rad, 1), retain=True, qos=1)
+    client.publish("erik-tune/forecast/solar_wm2", round(rad_h, 1),
+                   retain=True, qos=1)
     client.publish("erik-tune/forecast/temp_c", t_h, retain=True, qos=1)
     client.publish("erik-tune/forecast/drop_c", drop, retain=True, qos=1)
     client.publish("erik-tune/weather/now",
                    json.dumps(weather, ensure_ascii=False), retain=True, qos=1)
+    log(f"väder OK: {temp} C, köldfaktor {kold} C | prognos {horizon} h:"
+        f" {t_h} C (sol {round(rad, 1)}/{round(rad_h, 1)} W/m2)")
 
 
 def weather_loop():
     while True:
         try:
             poll_weather()
+            _log_states.pop("weather_err", None)   # felet är läkt: logga nästa fel igen
         except Exception as exc:
             with _lock:
                 if not _state["mqtt_error"]:
                     _state["mqtt_error"] = f"väderfel: {exc}"
+            log_change("weather_err", f"väderfel: {exc}")
         time.sleep(int(CONFIG["weather"]["poll_interval_s"]))
 
 
@@ -643,6 +689,9 @@ def auto_regulate():
         new_bias = max(-mx, min(mx, bias + float(a["learn_rate"]) * err))
         a["bands"][str(band)] = round(new_bias, 3)
         _state["last_learn"] = time.time()   # lam/lar husvis: max var 15 min
+        log(f"regulatorn lär: band {band}, fel {err:+.2f} C"
+            f" -> bias {round(new_bias, 3):+.2f} C"
+            + (f", effekt {pw} kW" if pw is not None else ""))
     return {"err": round(err, 2), "corr": round(corr, 2), "band": band,
             "ar_c": round(ar, 2), "bor_c": bor, "bias": round(new_bias, 3),
             "pw": pw, "corr_p": round(corr_p, 2)}
@@ -1137,6 +1186,7 @@ async def topics_use(request: Request):
         CONFIG["topics"][role] = topic
         save_config(CONFIG)
         _mqtt_rebuild.set()  # prenumerera om med den nya rollkopplingen
+        log(f"rollkoppling: {role} <- {topic}")
     return RedirectResponse("/setup", status_code=303)
 
 
@@ -1228,10 +1278,13 @@ async def tune_post(request: Request):
             i[k] = float(f.get(k) or 0)
         except ValueError:
             pass
+    old_ph = i.get("pre_hours", 6)
     try:
         i["pre_hours"] = max(1, min(48, int(f.get("pre_hours") or 6)))
     except ValueError:
         pass
+    if i["pre_hours"] != old_ph:
+        _mqtt_rebuild.set()   # oppublicera discovery: ny horisont i namnen
     CONFIG["publish"]["inject"] = "off" if f.get("pub") == "off" else "on"
     save_config(CONFIG)
     return RedirectResponse("/", status_code=303)
@@ -1262,6 +1315,7 @@ async def setpoint_post(request: Request):
             CONFIG["auto"]["setpoint_c"] = v
             save_config(CONFIG)
             publish_state()
+            log(f"börvärde = {v} C (webben)")
     except (TypeError, ValueError):
         pass
     return RedirectResponse("/", status_code=303)
@@ -1273,6 +1327,7 @@ async def auto_post():
     CONFIG["auto"]["enabled"] = (
         "off" if CONFIG["auto"].get("enabled") == "on" else "on")
     save_config(CONFIG)
+    log(f"självlärande reglering: {CONFIG['auto']['enabled'].upper()}")
     return RedirectResponse("/", status_code=303)
 
 
@@ -1291,6 +1346,10 @@ def healthz():
 # --------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    log("Erik Tune startar: webb på port "
+        f"{WEB_PORT}, data i {DATA}, mqtt {CONFIG['mqtt']['host'] or 'ej satt'}"
+        f" | mode {CONFIG['injector']['mode']}, reglering "
+        f"{CONFIG['auto'].get('enabled', 'off')}")
     threading.Thread(target=mqtt_manager, daemon=True).start()
     threading.Thread(target=weather_loop, daemon=True).start()
     threading.Thread(target=control_loop, daemon=True).start()
