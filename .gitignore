@@ -1,0 +1,15 @@
+# Erik Tune: data lives here (config.json, samples.db, heartbeat)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Environment / secrets
+.env
+ngenic.env
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
