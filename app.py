@@ -159,24 +159,36 @@ def read_series(key: str, seconds: int):
 # --------------------------------------------------------------------------
 
 _topic_to_role: dict = {}
-_seen: dict = {}  # topic -> {"payload": str,"ts": float}: topicutforskaren
+_role_json_key: dict = {}   # roll -> JSON-nyckel (t.ex. 'temp1'), "" = hela payload
+_seen: dict = {}  # topic -> {"payload","ts","fields"}: topicutforskaren
 
 
 def record_seen(msg) -> None:
-    """Minnestabell över allt som publicerats (topicutforskaren i webb-UI:t)."""
+    """Minnestabell över allt som publicerats (topicutforskaren i webb-UI:t).
+    JSON-objekt med numeriska värden bryts ut per nyckel i 'fields'."""
     try:
         payload = msg.payload.decode("utf-8", "replace")[:80]
     except Exception:
         payload = ""
+    fields = {}
+    try:
+        obj = json.loads(msg.payload)
+        if isinstance(obj, dict):
+            fields = {k: v for k, v in obj.items()
+                      if isinstance(v, (int, float))}
+    except (TypeError, ValueError):
+        pass
     with _lock:
-        _seen[msg.topic] = {"payload": payload, "ts": time.time()}
+        _seen[msg.topic] = {"payload": payload, "ts": time.time(),
+                            "fields": fields}
         if len(_seen) > 3000:  # kapa: släpp de äldsta
             for t in sorted(_seen, key=lambda k: _seen[k]["ts"])[:1000]:
                 del _seen[t]
 
 
-def parse_value(payload: bytes):
-    """Tal, tal-i-JSON eller strängsiffra -> float, annars None."""
+def parse_value(payload: bytes, key: str = None):
+    """Tal, tal-i-JSON eller strängsiffra -> float, annars None.
+    key: hämta en viss nyckel ur ett JSON-objekt (t.ex. 'temp1')."""
     try:
         return float(payload)
     except (TypeError, ValueError):
@@ -186,6 +198,11 @@ def parse_value(payload: bytes):
     except (TypeError, ValueError):
         return None
     if isinstance(obj, dict):
+        if key:
+            v = obj.get(key)
+            if isinstance(v, (int, float)):
+                return float(v)
+            return None
         for k in ("state", "value", "temperature"):
             if k in obj and isinstance(obj[k], (int, float)):
                 return float(obj[k])
@@ -250,10 +267,12 @@ def on_connect(client, userdata, flags, reason_code, properties):
         client.subscribe("erik-tune/cmd/#", qos=1)
         if CONFIG["mqtt"].get("explorer", "on") == "on":
             client.subscribe("#", qos=0)  # topicutforskaren: se allt på busen
-        for role, topic in CONFIG["topics"].items():
-            if topic:
-                client.subscribe(topic, qos=1)
-                _topic_to_role[topic] = role
+        for role, spec in CONFIG["topics"].items():
+            if spec:
+                base, _, key = spec.partition("|")  # topic|json-nyckel
+                client.subscribe(base, qos=1)
+                _topic_to_role[base] = role
+                _role_json_key[role] = key or ""
         publish_discovery(client)
     else:
         with _lock:
@@ -271,7 +290,7 @@ def on_message(client, userdata, msg):
         record_seen(msg)      # topicutforskaren: minnestabell över alla topics
         return
     role = _topic_to_role.get(msg.topic)
-    val = parse_value(msg.payload)
+    val = parse_value(msg.payload, _role_json_key.get(role) or None)
     if val is None:
         return
     with _lock:
@@ -311,6 +330,7 @@ def mqtt_manager():
                 pass
             with _lock:
                 _topic_to_role.clear()
+                _role_json_key.clear()
             client = build_client()
             _loop_started = False
         host, port = CONFIG["mqtt"]["host"], int(CONFIG["mqtt"]["port"])
@@ -600,7 +620,10 @@ sök på namn/värde och koppla en topic direkt till en roll - inga
 topic-namn att skriva utantill.</a></p>
 <p class="muted">Tips: HA-entiteter som inte redan finns på MQTT (SMHI-ute,
 köldfaktorn, Tado) streamas enklast ut med en automation som gör
-<code>mqtt.publish</code> vid varje ändring – se README.</p>
+<code>mqtt.publish</code> vid varje ändring – se README.
+Topics som publicerar JSON-objekt (t.ex. wmbus-mätarna) kopplas som
+<code>topic|nyckel</code>, t.ex. <code>fjv/kamstrup/values|temp1</code> –
+topicutforskaren bryter ut nycklarna automatiskt.</p>
 """
 
 TUNE_T = """
@@ -727,7 +750,13 @@ def dashboard():
 def setup_get():
     with _lock:
         seen = sorted(_seen.items(), key=lambda kv: kv[1]["ts"], reverse=True)
-    seen_rows = [{"topic": t, "payload": d["payload"][:40],
+    def _disp(d):
+        f = d.get("fields")
+        if f:
+            return " ".join(f"{k}={v}" for k, v in list(f.items())[:5])
+        return d["payload"][:40]
+
+    seen_rows = [{"topic": t, "payload": _disp(d),
                   "age": fmt_age(d["ts"])} for t, d in seen[:12]]
     ex = CONFIG["mqtt"].get("explorer", "on")
     return render(SETUP_T, cfg=CONFIG, roles=ROLES,
@@ -765,14 +794,17 @@ TOPICS_T = """
 Visa även HA-discovery, egna erik-tune och systemtopics</label>
 <button>Filtrera</button></form>
 <p class="muted">{{ n }} topics visas (ur {{ total }} sedda; listan toppas vid
-max 200). Retained-meddelanden syns direkt efter anslutning.</p>
+max 200). Retained-meddelanden syns direkt efter anslutning.
+JSON-topics (t.ex. wmbus-mätare) listas per nyckel: raden
+<code>fjv/kamstrup/values ◆ temp1</code> kopplar rollen till
+<code>fjv/kamstrup/values|temp1</code>.</p>
 <table><tr><th>Topic</th><th>Senaste värde</th><th>Senast</th>
 <th>Koppla till roll</th></tr>
 {% for r in rows %}
 <tr><td>{{r.topic}}</td><td class="muted">{{r.payload}}</td>
 <td class="muted">{{r.age}}</td><td>
 <form method="post" action="/topics/use">
-<input type="hidden" name="topic" value="{{r.topic}}">
+<input type="hidden" name="topic" value="{{r.assign}}">
 <select name="role">{{role_opts}}</select>
 <button>Använd</button></form></td></tr>
 {% endfor %}
@@ -797,8 +829,17 @@ def topics(q: str = "", showall: str = ""):
     if qf:
         items = [(t, d) for t, d in items
                  if qf in t.lower() or qf in d["payload"].lower()]
-    rows = [{"topic": t, "payload": d["payload"], "age": fmt_age(d["ts"])}
-            for t, d in items[:200]]
+    rows = []
+    for t, d in items[:200]:
+        if d.get("fields"):   # JSON-topic: en rad per nyckel = valbara direkt
+            for k in sorted(d["fields"]):
+                rows.append({"topic": f"{t} ◆ {k}",
+                             "payload": str(d["fields"][k]),
+                             "age": fmt_age(d["ts"]),
+                             "assign": f"{t}|{k}"})
+        else:
+            rows.append({"topic": t, "payload": d["payload"],
+                         "age": fmt_age(d["ts"]), "assign": t})
     role_opts = "".join(f'<option value="{r}">{r}</option>' for r in ROLES)
     return render(TOPICS_T, rows=rows, q=q or "",
                   role_opts=role_opts,
