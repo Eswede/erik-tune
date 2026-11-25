@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Erik Tune: en egen "Ngenic Tune-ersättare" i EN Python-fil.
@@ -28,15 +27,39 @@ ESP32-sidan; själva watchdog-logiken (heartbeat-timeout -> digipot till fast
 0C-värde) sitter i ESP32:n - se projektanteckningarna.
 
 Kör: all konfiguration via /setup i webgränssnittet; sparas i /data/config.json.
+
+v0.18 (efter extern kodgranskning 24/11 2026):
+- TECKENKORRIGERING i regulatorn: positiv "corr" betyder numera ÖKA
+  värmebehovet, dvs Inject MINSKAS med corr i control_loop (tidigare
+  adderades den, vilket gav positiv återkoppling:
+  för kallt hus -> fejk varmare -> ännu kallare).
+- Regulatorns fältfilter (30-min-medel) byggs på RÅ rumstemp (indoor_temp_c)
+  ur databasen - inte det redan filtrerade ar_c-värdet (rekursivt filter borta).
+- influence räknas som Inject - ute EFTER klippning (stämmer vid tak/golv).
+- /setup: ändrade topic-kopplingar omprenumereras direkt (inte vid omstart).
+- Tidszon: prognosindex väljs med ZoneInfo(config-tz), inte containerns TZ;
+  ort-sökningen sparar även tidszonen som hör till valt ställe.
+- save_config körs bara när regulatorn faktiskt lärt något (dirty-flagga),
+  inte var 60:e minut (SD-kort på Pi).
+- DHW-gate (beslut 24/11): balansinlärning och effekt-innerslingan hoppas
+  över vid tappstopp (effekt > power_skip_kw ELLER flöde > flow_skip_lh).
+- SQLite: trådlås kring all access + WAL-journal (läsare i web-trådar).
+- Enkel rensning: samples.db gallras dagligen (logging.retention_days).
+- Webb: jinja2 autoescape=True; betrodd intern HTML wrappas i Markup().
+- compute_inject/auto_regulate är rena funktioner (testdata som arg) =>
+  testbar utan MQTT/FastAPI (se tests/test_regulator.py).
 """
 
+import html
 import json
 import os
 import sqlite3
 import threading
 import time
 import urllib.parse
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 import paho.mqtt.client as mqtt
@@ -44,6 +67,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 import uvicorn
 from jinja2 import Environment
+from markupsafe import Markup
 
 # --------------------------------------------------------------------------
 # Konfiguration och beständighet
@@ -61,6 +85,7 @@ CYCLE_S = 60  # injektionsberäkning/publicering/logging
 # ---- logg rakt till stdout: `docker logs erik-tune` -----------------------------
 _log_states: dict = {}    # nyckel -> senaste meddelandet (endast ändringar loggas)
 _log_first: set = set()  # roller som redan loggats första gången
+_log_lock = threading.Lock()  # _log_states/_log_first nås från flera trådar
 
 
 def log(msg: str) -> None:
@@ -70,9 +95,10 @@ def log(msg: str) -> None:
 
 def log_change(key: str, msg: str) -> None:
     """Logga bara om tillståndet ändrats sedan förra raden för nyckeln."""
-    if _log_states.get(key) != msg:
-        log(msg)
-        _log_states[key] = msg
+    with _log_lock:
+        if _log_states.get(key) != msg:
+            _log_states[key] = msg
+            log(msg)
 
 ROLES = {
     "ute_temp_c":        "Utetemperatur (verklig; kan med fördel hämtas från väder-APIt om topic saknas)",
@@ -100,6 +126,7 @@ DEFAULT_CONFIG = {
         "min_inject_c": -30.0, "max_inject_c": 30.0,
     },
     "weather": {"poll_interval_s": 1800},
+    "logging": {"retention_days": 400},   # gallring av samples.db (0 = av)
     "publish": {"inject": "on", "discovery": "on"},
     "auto": {
         "enabled": "off",        # självlärande rumsreglering (är/bör)
@@ -108,20 +135,27 @@ DEFAULT_CONFIG = {
         "learn_rate": 0.05,      # band-minnets steg per lärtillfälle (I-ledet)
         "learn_interval_s": 900, # lär max var 15 min: huset svarar i timmar
         "deadband_c": 0.3,       # fält inom dödbandet: inget nytt lärande
-        "avg_window_s": 1800,    # fültret: medel av rumstemp senaste 30 min
+        "avg_window_s": 1800,    # fältfilter: medel av RÅ rumstemp senaste 30 min
         "band_size": 5,          # köldfaktorbandens bredd, °C
         "power_gain": 0.5,       # grader inject per kW effectgap (snabb innerslinga)
         "power_max_age_s": 900,  # effectvandet far vara max 15 min gammalt
-        # Frö fran arsdata (5 552 h dec25-nov26, Tin ~21.4 C): matad effekt
-        # per koldfaktorband, justerat ~+2.5 C (kold ar vindkylt vs ute),
-        # inkl varmvatten ~1.2 kW golfloor. EMA (0.9/0.1) ratter till
-        # verkliga vardet inom nagra dagar; band utan frö lar fran nuvarande.
+        # DHW-gate (beslut 24/11): tappstopp >10 kW uppmätta, normal radiatorlast
+        # p95 = 7,2 kW. Blir effekt ELLER flöde över trösklarna: hoppa över
+        # balansinlärning och stäng effekt-korrigeringen (corr_p = 0) - annars
+        # lär regulatorn in duschar som "balanseffekt" per köld-band och driver
+        # inject fel vid ren radiatorlast.
+        "power_skip_kw": 8.0,    # kW: över = tappstopp, effekt-regleringen pausas
+        "flow_skip_lh": 300.0,   # l/h primärt flöde: över = dubbelkontroll tappstopp
+        # Frön från årsdata (5 552 h dec25-nov26, Tin ~21,4 C): matad effekt
+        # per köldfaktorband, justerat ~+2,5 C (kold är vindkylt vs ute),
+        # inkl varmvatten ~1,2 kW som golv. EMA (0.9/0.1) rätar fröna mot
+        # det verkliga värdet inom några dagar; band utan frö lär från nuet.
         "p_bal": {"25": 1.2, "20": 1.2, "15": 1.1, "10": 1.3, "5": 1.6,
                   "0": 2.2, "-5": 3.3, "-10": 4.6, "-15": 5.5, "-20": 5.9,
                   "-25": 7.0},   # band -> balanserad effekt (kW)
         "max_correction_c": 3.0,
         "sample_max_age_s": 1800,
-        "bands": {},             # minnet: börvärde-for-skewing: band -> korrigering
+        "bands": {},             # minnet: band -> inlärd korrigering (POSITIVT = mer värmebehov)
     },
 }
 
@@ -164,6 +198,9 @@ _state = {
     "influence_c": None,
     "last_calc": 0,
     "last_weather_ok": 0,
+    "last_learn": 0,      # regulatorn: senaste lärtillfället (bands-minnet)
+    "last_reg": None,     # senaste reglersvar (dashboarden)
+    "last_prune": 0,      # senaste gallringen av samples.db
     "boot_ts": time.time(),
 }
 
@@ -171,25 +208,48 @@ _state = {
 # SQLite: underlaget för marsregressionen I = c + d*T_ute
 # --------------------------------------------------------------------------
 
+# Anslutningen delas av flera trådar (control_loop skriver, webtrådar läser
+# i dashboarden) => ett lås krävs: check_same_thread=False stänger bara av
+# pysqlites trådkontroll, den skyddar inte mot samtidig access.
+_db_lock = threading.Lock()
 _db = sqlite3.connect(DB_PATH, check_same_thread=False)
-_db.execute("CREATE TABLE IF NOT EXISTS samples ("
-            " ts INTEGER NOT NULL, key TEXT NOT NULL, value REAL NOT NULL,"
-            " PRIMARY KEY (ts, key))")
-_db.execute("CREATE INDEX IF NOT EXISTS idx_samples_key ON samples(key, ts)")
-_db.commit()
+with _db_lock:
+    _db.execute("CREATE TABLE IF NOT EXISTS samples ("
+                " ts INTEGER NOT NULL, key TEXT NOT NULL, value REAL NOT NULL,"
+                " PRIMARY KEY (ts, key))")
+    _db.execute("CREATE INDEX IF NOT EXISTS idx_samples_key ON samples(key, ts)")
+    try:
+        _db.execute("PRAGMA journal_mode=WAL")  # låser mindre vid läs/skriv samtidigt
+    except sqlite3.Error:
+        pass   # journal-läget är en optimering, inte ett krav
+    _db.commit()
 
 
 def log_sample(key: str, value: float) -> None:
-    _db.execute("INSERT OR REPLACE INTO samples VALUES (?,?,?)",
-                (int(time.time()), key, float(value)))
-    _db.commit()
+    with _db_lock:
+        _db.execute("INSERT OR REPLACE INTO samples VALUES (?,?,?)",
+                    (int(time.time()), key, float(value)))
+        _db.commit()
 
 
 def read_series(key: str, seconds: int):
     since = int(time.time() - seconds)
-    return _db.execute(
-        "SELECT ts, value FROM samples WHERE key=? AND ts>=? ORDER BY ts",
-        (key, since)).fetchall()
+    with _db_lock:
+        return _db.execute(
+            "SELECT ts, value FROM samples WHERE key=? AND ts>=? ORDER BY ts",
+            (key, since)).fetchall()
+
+
+def prune_samples(retention_days: int) -> int:
+    """Gallra gamla rader ur samples.db (körs ~dagligen från control_loop).
+    ~10 rader/min utan rensning = flera miljoner rader per år."""
+    if retention_days and int(retention_days) > 0:
+        cutoff = int(time.time() - int(retention_days) * 86400)
+        with _db_lock:
+            cur = _db.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
+            _db.commit()
+            return cur.rowcount
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -263,7 +323,7 @@ def parse_value(payload: bytes, key: str = None):
                 return float(obj[k])
         for k, v in obj.items():
             if k not in _NOISE_KEYS and isinstance(v, (int, float)):
-                return float(v)  # ratt matvarde, inte rssi/battery/linkquality
+                return float(v)  # rätt mätvärde, inte rssi/battery/linkquality
     if isinstance(obj, (int, float)):
         return float(obj)
     return None
@@ -397,10 +457,11 @@ def on_connect(client, userdata, flags, reason_code, properties):
             if spec:
                 base, _, key = spec.partition("|")  # topic|json-nyckel
                 client.subscribe(base, qos=1)
-                lst = _topic_to_role.setdefault(base, [])
-                if role not in lst:      # samma topic kan mata flera roller
-                    lst.append(role)
-                _role_json_key[role] = key or ""
+                with _lock:
+                    lst = _topic_to_role.setdefault(base, [])
+                    if role not in lst:      # samma topic kan mata flera roller
+                        lst.append(role)
+                    _role_json_key[role] = key or ""
         publish_discovery(client)
         n = sum(1 for s in CONFIG["topics"].values() if s)
         log(f"MQTT ansluten {CONFIG['mqtt']['host']}:{CONFIG['mqtt']['port']}"
@@ -424,22 +485,22 @@ def on_message(client, userdata, msg):
         handle_cmd(client, msg)  # kommandon från HA (setpoint, mode)
         return
     record_seen(msg)          # minnestabellen: ALLA topics, aven rollkopplade
-    roles = _topic_to_role.get(msg.topic)
+    with _lock:               # mqtt_manager kan tömma maparna parallellt
+        roles = list(_topic_to_role.get(msg.topic) or [])
+        jkeys = {r: _role_json_key.get(r) for r in roles}
     if not roles:
         return
-    for role in list(roles):  # en topic kan mata flera roller (t1_c + t2_c)
-        val = parse_value(msg.payload, _role_json_key.get(role) or None)
+    for role in roles:  # en topic kan mata flera roller (t1_c + t2_c)
+        val = parse_value(msg.payload, jkeys.get(role) or None)
         if val is None:
             continue
         with _lock:
             _state["samples"][role] = {"ts": time.time(), "value": val,
                                        "topic": msg.topic}
-        if role not in _log_first:
-            with _lock:
-                seen_before = role in _log_first
-                _log_first.add(role)
-            if not seen_before:
-                log(f"roll {role} = {val} ({msg.topic})   [första värdet]")
+            first = role not in _log_first
+            _log_first.add(role)
+        if first:
+            log(f"roll {role} = {val} ({msg.topic})   [första värdet]")
 
 
 def build_client():
@@ -511,6 +572,18 @@ OM_URL = ("https://api.open-meteo.com/v1/forecast"
           "&forecast_days=3&timezone={tz}")
 
 
+def _now_label(tz_name: str) -> str:
+    """'YYYY-MM-DDTHH:00' i konfigurerad tidszon (ZoneInfo ur standardbiblioteket).
+    Oberoende av containerns TZ-miljövariabel: körs containern i UTC blir
+    inte index längre fel mot Open-Meteos lokala tidsstämplar. Ogiltig
+    tidszon faller tillbaka på UTC i stället för att krascha väderloopen."""
+    try:
+        now = datetime.now(ZoneInfo(tz_name or "Europe/Stockholm"))
+    except Exception:
+        now = datetime.now(ZoneInfo("UTC"))
+    return now.strftime("%Y-%m-%dT%H:00")
+
+
 def poll_weather():
     cfg = CONFIG["location"]
     url = OM_URL.format(lat=cfg["lat"], lon=cfg["lon"], tz=cfg["tz"])
@@ -518,7 +591,7 @@ def poll_weather():
     r.raise_for_status()
     h = r.json()["hourly"]
     times, temps = h["time"], h["temperature_2m"]
-    local_now = time.strftime("%Y-%m-%dT%H:00", time.localtime())
+    local_now = _now_label(cfg.get("tz"))   # Open-Meteos tider är i samma tz
     idx = 0
     for i, t in enumerate(times):
         if t <= local_now:
@@ -588,7 +661,8 @@ def weather_loop():
 # --------------------------------------------------------------------------
 
 def get_sample(role):
-    s = _state["samples"].get(role)
+    with _lock:
+        s = _state["samples"].get(role)
     if s and time.time() - s["ts"] < 3600:
         return s["value"]
     return None
@@ -599,121 +673,227 @@ def current_ute():
     ute = get_sample("ute_temp_c")
     if ute is not None:
         return ute
-    w = _state["weather"]
+    with _lock:
+        w = _state["weather"]
     if w and time.time() - w["ts"] < 4000:
         return w["temp_c"]
     return None
 
 
-def compute_inject():
+def clip_inject(v, p):
+    """Klipp till [min_inject_c, max_inject_c] med två decimaler."""
+    return round(max(float(p["min_inject_c"]),
+                     min(float(p["max_inject_c"]), v)), 2)
+
+
+def compute_inject(ute, w=None, p=None):
     """
-    Inject = ute + offset + koldfaktorterm + solterm + prognosterm, klippt.
+    REN FUNKTION (testbar utan MQTT/DB): Inject = ute + offset +
+    koldfaktorterm + solterm + prognosterm, klippt.
+      ute: verklig utetemp (None => None, None)
+      w:   väder-dict (koldfaktor_c, solar_wm2, forecast_drop_c)
+      p:   injector-config (offset_c, *_gain, min/max)
     Med default (alla gains = 0, offset = 0) blir Inject = ute, dvs
     Influence = 0: man ser tydligt vad man gör när man vrider på parametrarna.
+    OBS tecknet: HÖGRE inject = fejkad VARMARE ute = MINDRE värme till huset.
     """
-    ute = current_ute()
     if ute is None:
         return None, None
-
-    p = CONFIG["injector"]
+    w = w or {}
+    if p is None:
+        p = CONFIG["injector"]
     inject = float(p["offset_c"])
 
-    kold = _state["weather"].get("koldfaktor_c")
+    kold = w.get("koldfaktor_c")
     if kold is not None and kold < ute:
         inject += float(p["koldfaktor_gain"]) * (kold - ute)  # kyliga halvan
 
-    rad = _state["weather"].get("solar_wm2") or 0.0
+    rad = w.get("solar_wm2") or 0.0
     inject += float(p["solar_gain"]) * rad / 100.0
 
-    drop = _state["weather"].get("forecast_drop_c")
+    drop = w.get("forecast_drop_c")
     if drop is not None:
         inject += float(p["pre_gain"]) * drop  # kallare fram = mer värme nu
 
     inject += ute
-    inject = max(float(p["min_inject_c"]),
-                  min(float(p["max_inject_c"]), inject))
-    return round(inject, 2), round(inject - ute, 2)
+    inject = clip_inject(inject, p)
+    return inject, round(inject - ute, 2)
 
 
-def auto_regulate():
-    """Självlärande rumsreglering (är/bör): P-led på felet + minne per
-    köldfaktorband. Returnerar reglerdata eller None (av / inga friska data)."""
-    a = CONFIG["auto"]
+def auto_regulate(a, indoor, ar_hist, kold, pw, flow_lh, now, last_learn):
+    """
+    REN FUNKTION (testbar utan MQTT/DB): självlärande rumsreglering (är/bör)
+    med P-led på felet + lärt bias per köldfaktorband + snabb effekt-innerslinga.
+
+      a:          auto-config-dict; MUTERAS (bands/p_bal består mellan anrop)
+      indoor:     (ts, value) färskt rumsvärde, eller None
+      ar_hist:    [(ts, value)] RÅ rumstemp-serie inom avg_window_s
+      kold:       köldfaktor (fallboll prognostemp): bandindex
+      pw, flow_lh: fjv-effekt kW / primärflöde l/h; kan vara None. Anroparen
+                  skickar bara FÄRSKA värden (< power_max_age_s).
+      now:        epoch-sekunder; last_learn: epoch för senaste lärtillfälle
+    Return: (reg, dirty). reg=None => reglering av / inga färska data.
+    dirty=True <=> bands/p_bal uppdaterats (då sparar control_loop config).
+
+    TECKENKONVENTION (v0.18): POSITIV corr = ÖKA värmebehovet = MER värme.
+    control_loop applicerar den som Inject MINUS corr, eftersom HÖGRE inject
+    = fejkad varmare ute = MINDRE värme till huset (värmekurvan faller).
+    """
     if a.get("enabled") != "on":
-        return None
-    rec = _state["samples"].get("indoor_temp_c")
-    if not rec or time.time() - rec["ts"] > int(a["sample_max_age_s"]):
-        return None
-    w = _state["weather"] or {}
-    kold = w.get("koldfaktor_c")
+        return None, False
+    if not indoor or now - indoor[0] > int(a["sample_max_age_s"]):
+        return None, False
     if kold is None:
-        kold = w.get("temp_c")   # fallbak: prognostemperatur som bandindex
-    if kold is None:
-        return None
-    # Hutrigt system: fültret felet pa 30-minursmedel av rumstempen,
-    # inte pa momentanvarden (dorr, spis, sol...)
-    pts = read_series("ar_c", int(a["avg_window_s"]))
-    if len(pts) >= 10:
-        ar = sum(p[1] for p in pts) / len(pts)
-    else:
-        ar = rec["value"]       # uppstart: ingen historik än
-    bor = float(a["setpoint_c"])
-    err = bor - ar
-    band = int(kold // int(a["band_size"])) * int(a["band_size"])
-    bias = float(a["bands"].get(str(band), 0.0))
-    mx = float(a["max_correction_c"])
+        return None, False
 
-    # Innerslinga: effekt (kW) ar mycket snabbare an rumstempen (minuter
-    # mot timmar). Nar huset ligger ratt lars vi bandets balanseffekt;
-    # nar det avviker drever effektgapet inject direkt.
-    pw, corr_p = None, 0.0
-    prec2 = _state["samples"].get("fjv_power_kw")
-    if (prec2 and time.time() - prec2["ts"] <= int(a["power_max_age_s"])
-            and float(a["power_gain"]) > 0):
-        pw = prec2["value"]
-        key = str(band)
-        if abs(err) <= float(a["deadband_c"]):
+    # Trögt system (tidskonstant ca 48 h): fältfilter = 30-min-medel av RÅ
+    # rumstemp (indoor_temp_c), inte momentanvärden (dörr, spis, sol...) och
+    # INTE det redan filtrerade ar_c-värdet (v0.17:s bugg: rekursivt filter
+    # med mångdubbelt längre eftersläpning). Serien måste täcka minst halva
+    # fönstret (glesa zigbee-givare, ~12 min, är OK), annars momentanvärdet.
+    win = int(a["avg_window_s"])
+    hist = [(ts, v) for ts, v in (ar_hist or []) if now - ts <= win]
+    if len(hist) >= 2 and now - hist[0][0] >= win / 2:
+        ar = sum(v for _, v in hist) / len(hist)
+    else:
+        ar = indoor[1]       # uppstart: ingen täckande historik än
+
+    bor = float(a["setpoint_c"])
+    err = bor - ar          # positivt = för kallt = behöver MER värme
+    band = int(kold // int(a["band_size"])) * int(a["band_size"])
+    key = str(band)
+    bias = float(a["bands"].get(key, 0.0))
+    mx = float(a["max_correction_c"])
+    dirty = False
+    hold = abs(err) <= float(a["deadband_c"])
+
+    # DHW-gate: tappstopp ger effekttoppar 17-33 kW/660-1020 l/h (nov-data)
+    # medan normal radiatorlast ligger under ~7,2 kW. Blir effekt ELLER flöde
+    # över tröskeln: hoppa över balansinlärning OCH sätt corr_p=0, annars
+    # lär regulatorn in duschar som balanseffekt per köld-band.
+    pw_tap = ((pw is not None and pw > float(a.get("power_skip_kw", 8.0)))
+              or (flow_lh is not None
+                  and flow_lh > float(a.get("flow_skip_lh", 300.0))))
+
+    # Innerslinga: effekt (kW) är snabbare än rumstempen (minuter mot
+    # timmar). När huset ligger rätt lär vi bandets balanseffekt
+    # (EMA 0.9/0.1); när det avviker driver effektgapet regleringen direkt.
+    corr_p = 0.0
+    if pw is not None and not pw_tap and float(a["power_gain"]) > 0:
+        if hold:
+            if key not in a["p_bal"]:      # nytt band i frötabellen = spara
+                dirty = True
             old = float(a["p_bal"].get(key, pw))
-            a["p_bal"][key] = round(old * 0.9 + pw * 0.1, 3)  # EMA
+            new = round(old * 0.9 + pw * 0.1, 3)   # EMA mot verkligheten
+            a["p_bal"][key] = new
+            if abs(new - old) >= 0.05:   # bara märkbar ändring triggar sparning
+                dirty = True
         elif key in a["p_bal"]:
             corr_p = max(-mx, min(mx,
                 float(a["power_gain"]) * (float(a["p_bal"][key]) - pw)))
 
-    if abs(err) <= float(a["deadband_c"]):
+    if hold:
         return {"err": 0.0, "corr": round(bias, 2), "band": band,
-                "ar_c": round(ar, 2), "bor_c": bor, "pw": pw,
-                "bias": round(bias, 3), "hold": True}   # dödband: hall minnet
+                "ar_c": round(ar, 2), "bor_c": bor, "bias": round(bias, 3),
+                "new_bias": round(bias, 3), "learned": False,
+                "learn_ts": last_learn, "hold": True, "pw": pw,
+                "flow_lh": flow_lh, "pw_tap": pw_tap,
+                "corr_p": 0.0}, dirty    # dödband: håll minnet
     corr = max(-mx, min(mx, bias + float(a["k_p"]) * err + corr_p))
     new_bias = bias
-    if time.time() - _state.get("last_learn", 0) >= int(a["learn_interval_s"]):
+    learned = False
+    if now - last_learn >= int(a["learn_interval_s"]):
         new_bias = max(-mx, min(mx, bias + float(a["learn_rate"]) * err))
-        a["bands"][str(band)] = round(new_bias, 3)
-        _state["last_learn"] = time.time()   # lam/lar husvis: max var 15 min
-        log(f"regulatorn lär: band {band}, fel {err:+.2f} C"
-            f" -> bias {round(new_bias, 3):+.2f} C"
-            + (f", effekt {pw} kW" if pw is not None else ""))
+        a["bands"][key] = round(new_bias, 3)
+        learned = True
+        dirty = True
+        last_learn = now      # lärtakt: max var 15 min (huset svarar i timmar)
     return {"err": round(err, 2), "corr": round(corr, 2), "band": band,
-            "ar_c": round(ar, 2), "bor_c": bor, "bias": round(new_bias, 3),
-            "pw": pw, "corr_p": round(corr_p, 2)}
+            "ar_c": round(ar, 2), "bor_c": bor, "bias": round(bias, 3),
+            "new_bias": round(new_bias, 3), "learned": learned,
+            "learn_ts": last_learn, "pw": pw, "flow_lh": flow_lh,
+            "pw_tap": pw_tap, "corr_p": round(corr_p, 2)}, dirty
+
+
+
+def apply_regulation(inject_c, reg, ute, p):
+    """KORRIGERINGENS TECKEN (v0.18): positiv corr = öka värmebehovet = MER
+    värme till huset. Reglercentralens kurva är FALLANDE, så mer värme fås
+    genom LÄGRE inject: därför subtraheras corr (v0.17 adderade, vilket gav
+    positiv återkoppling). Influence räknas EFTER klippningen så att
+    "Influence = Inject - verklig ute" håller även vid tak/golv."""
+    inject_c = clip_inject(inject_c - reg["corr"], p)
+    return inject_c, round(inject_c - ute, 2)
 
 
 def control_loop():
     while True:
         try:
-            inject_c, influence_c = compute_inject()
-            reg = auto_regulate()
+            with _lock:
+                w = dict(_state["weather"] or {})
+                samples = dict(_state["samples"])   # skalet kopieras; posterna ersätts aldrig
+                last_learn = _state["last_learn"]
+                last_prune = _state["last_prune"]
+
+            # gallra samples.db ~en gång per dygn (logging.retention_days)
+            if time.time() - last_prune >= 86400:
+                removed = prune_samples(int(CONFIG["logging"].get("retention_days", 400)))
+                with _lock:
+                    _state["last_prune"] = time.time()
+                if removed:
+                    log(f"samples.db: gallrade {removed} rader (äldre än "
+                        f"{CONFIG['logging'].get('retention_days')} dagar)")
+
+            ute_now = current_ute()
+            p = CONFIG["injector"]
+            inject_c, influence_c = compute_inject(ute_now, w, p)
+
+            # Regulatorn: ren funktion, all historik skickas som argument.
+            a = CONFIG["auto"]
+            indoor = samples.get("indoor_temp_c")
+            pwrec = samples.get("fjv_power_kw")
+            flrec = samples.get("fjv_flow_lh")
+            pw = (pwrec["value"] if pwrec and
+                  time.time() - pwrec["ts"] <= int(a["power_max_age_s"]) else None)
+            flow_lh = (flrec["value"] if flrec and
+                       time.time() - flrec["ts"] <= int(a["power_max_age_s"])
+                       else None)
+            kold = w.get("koldfaktor_c")
+            if kold is None:
+                kold = w.get("temp_c")   # fallboll: prognostemp som bandindex
+            # RÅ rumstemp ur databasen (inte ar_c: rekursivt filter i v0.17)
+            ar_hist = read_series("indoor_temp_c", int(a["avg_window_s"]))
+            reg, dirty = auto_regulate(a, indoor, ar_hist, kold, pw, flow_lh,
+                                       time.time(), last_learn)
+            if reg is not None:
+                with _lock:
+                    _state["last_learn"] = reg["learn_ts"]
+                if reg["learned"]:
+                    log(f"regulatorn lär: band {reg['band']}, "
+                        f"fel {reg['err']:+.2f} C"
+                        f" -> bias {reg['new_bias']:+.2f} C"
+                        + (f", effekt {reg['pw']} kW"
+                           if reg["pw"] is not None else ""))
+                if reg["pw_tap"]:
+                    log_change("tap",
+                               f"tappstopp: effekt {reg['pw']} kW / "
+                               f"flöde {reg['flow_lh']} l/h - "
+                               "balansinlärning och effekt-korrigeringen pausad")
+                else:
+                    with _log_lock:
+                        _log_states.pop("tap", None)   # tappstopps-läget läkt
+
             if inject_c is not None and reg is not None:
-                inject_c = round(max(float(CONFIG["injector"]["min_inject_c"]),
-                    min(float(CONFIG["injector"]["max_inject_c"]),
-                        inject_c + reg["corr"])), 2)
-                influence_c = round(influence_c + reg["corr"], 2)
+                inject_c, influence_c = apply_regulation(
+                    inject_c, reg, ute_now, p)
                 client.publish("erik-tune/room/ar_c", reg["ar_c"],
                                retain=True, qos=1)
                 client.publish("erik-tune/room/bor_c", reg["bor_c"],
                                retain=True, qos=1)
-                log_sample("ar_c", reg["ar_c"])
-                log_sample("err_c", reg["err"])
-                save_config(CONFIG)   # regulatorns minne består omstarten
+                log_sample("ar_c", reg["ar_c"])   # display/marsdata; regulatorn
+                log_sample("err_c", reg["err"])     # läser RÅ indoor_temp_c
+                if dirty:   # bands/p_bal uppdaterat: minnet består omstarten
+                    save_config(CONFIG)
                 with _lock:
                     _state["last_reg"] = reg
             if inject_c is not None:
@@ -744,9 +924,9 @@ def control_loop():
         time.sleep(CYCLE_S)
 
 
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Webgränssnitt (svenska, LAN-internt; ingen autentisering: aldrig portforw.)
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -796,7 +976,7 @@ DASH_T = """
 <h2>MQTT-ingångar</h2>
 <table><tr><th>Roll</th><th>Värde</th><th>Senast</th><th>Topic</th></tr>
 {% for r in rows %}<tr><td>{{r.role}}</td><td>{{r.val}}</td>
-<td class="muted">{{r.age}}</td><td class="muted">{{r.topic}}</td></tr>{% endfor %}
+<td class="muted">{{r.age}}</td><td class="muted">{{r.topic}}{{r.diag}}</td></tr>{% endfor %}
 </table>
 
 <h2>Rumsreglering: är/bör</h2>
@@ -821,7 +1001,7 @@ DASH_T = """
 SETUP_T = """
 <h2>Position: var på planeten?</h2>
 <div class="card"><span>Valt ställe för väderprognos</span>
- <span class="big">{{ place }}</span></div>
+ <span class="big">{{ place }}<div class="muted">tidszon {{cfg["location"]["tz"]}} (styr prognos-indexet)</div></span></div>
 <form method="get" action="/geo/search">
 <label>Sök ort (Open-Meteo geokodning, svenska)</label>
 <input name="q" placeholder="t.ex. Borlänge, Säter, Mora...">
@@ -902,9 +1082,14 @@ Influence = Inject − ute. Nollställda gains ger Inject = ute.</p>
 
 
 def render(body_t, dash=False, **ctx):
-    env = Environment()
+    # autoescape=True: MQTT-payloads, topic-namn, söksträngar m.m. escapes
+    # automatiskt (trasiga payloads kan inte sönder layouten). Betrodd
+    # intern HTML (spark/forecast/learn_table/pager/role_opts/diag) skickas
+    # in inslagen i Markup(...) av anroparen - se länkarna nedan.
+    env = Environment(autoescape=True)
+    body = env.from_string(body_t).render(**ctx)
     return HTMLResponse(env.from_string(BASE_T).render(
-        css=CSS, body=env.from_string(body_t).render(**ctx), dash=dash))
+        css=CSS, body=Markup(body), dash=dash))
 
 
 def fmt_age(ts):
@@ -929,8 +1114,11 @@ def topic_diag(spec):
         return ' <span class="warn">topic aldrig sedd sedan start</span>'
     out = f' <span class="warn">sedd {fmt_age(seen["ts"])} sedan</span>'
     if key and key not in (fields or {}):
-        ks = ", ".join(list(fields)[:6]) if fields else "inga num. nycklar"
-        out += (f' <span class="warn">nyckeln {key} saknas!'
+        # nycklar/värden kommer från MQTT-payloads: escape:a även om hela
+        # diag-blocket wrappas i Markup av anroparen (den stänger escape)
+        ks = ", ".join(html.escape(k) for k in list(fields)[:6]) \
+            if fields else "inga num. nycklar"
+        out += (f' <span class="warn">nyckeln {html.escape(key)} saknas!'
                 f' finns: {ks}</span>')
     return out
 
@@ -977,8 +1165,8 @@ def dashboard():
             "role": role,
             "val": f"{rec['value']:.2f}" if rec else "-",
             "age": fmt_age(rec["ts"]) if rec else "-",
-            "topic": ((rec["topic"] if rec else (spec or "-"))
-                      + (topic_diag(spec) if stale else "")),
+            "topic": (rec["topic"] if rec else (spec or "-")),
+            "diag": Markup(topic_diag(spec)) if stale else Markup(""),
         })
 
     forecast_svg = ""
@@ -1006,12 +1194,20 @@ def dashboard():
     if learn_rows:
         learn_table = ("<h2>Regulatorns minne (inlärd korrigering per"
                        " köldfaktorband)</h2><table><tr><th>Band</th>"
-                       f"<th>Korrigering</th></tr>{learn_rows}</table>")
+                       "<th>Korrigering</th></tr>"
+                       f"{learn_rows}</table>"
+                       '<p class="muted">Positiv korrigering = ökat'
+                       " värmebehov: Inject sänks med samma belopp"
+                       " (högre inject = fejk varmare = mindre värme).</p>")
     if _state.get("last_reg"):
         lg = _state["last_reg"]
         learn_table += (f'<p class="muted">Senaste reglering: fel {lg["err"]} °C'
-                        f', korrigering {lg["corr"]} °C, band {lg["band"]}'
-                        + (f', effekt {lg["pw"]} kW' if lg.get("pw") is not None else '')
+                        f', korrigering {lg["corr"]} °C (positivt = mer värme),'
+                        f' band {lg["band"]}'
+                        + (f', effekt {lg["pw"]} kW'
+                           if lg.get("pw") is not None else '')
+                        + (', tappstopp: regleringen pausad'
+                           if lg.get("pw_tap") else '')
                         + '.</p>')
 
     return render(DASH_T, dash=True,
@@ -1036,9 +1232,9 @@ def dashboard():
         w_fk=((w or {}).get("forecast_koldfaktor_c", "-")),
         w_kold_drop=((w or {}).get("koldfaktor_drop_c", "-")),
         pre_h=CONFIG["injector"]["pre_hours"],
-        spark=spark_svg(), w_forecast_svg=forecast_svg,
+        spark=Markup(spark_svg()), w_forecast_svg=Markup(forecast_svg),
         ar=ar, bor=a["setpoint_c"],
-        auto_on=(a.get("enabled") == "on"), learn_table=learn_table)
+        auto_on=(a.get("enabled") == "on"), learn_table=Markup(learn_table))
 
 
 @app.get("/setup", response_class=HTMLResponse)
@@ -1069,7 +1265,7 @@ GEO_T = """
 {% for h in hits %}<tr>
 <td>{{ h.name }}<div class="muted">{{ h.admin }}, {{ h.country }}</div></td>
 <td class="muted">{{ h.lat }}, {{ h.lon }}</td>
-<td><a href="/geo/set?lat={{ h.lat }}&lon={{ h.lon }}&name={{ h.name_url }}">Välj</a></td>
+<td><a href="/geo/set?lat={{ h.lat }}&lon={{ h.lon }}&tz={{ h.tz }}&name={{ h.name_url }}">Välj</a></td>
 </tr>{% endfor %}
 </table>
 {% else %}
@@ -1171,10 +1367,10 @@ def topics(q: str = "", showall: str = "", page: int = 1):
         pager = ""
     role_opts = "".join(f'<option value="{r}">{r}</option>' for r in ROLES)
     return render(TOPICS_T, rows=rows, q=q or "",
-                  role_opts=role_opts,
+                  role_opts=Markup(role_opts),
                   allsel="checked" if showall else "",
                   n=len(rows), total=len(all_rows),
-                  seen_total=seen_total, pager=pager)
+                  seen_total=seen_total, pager=Markup(pager))
 
 
 @app.post("/topics/use")
@@ -1207,17 +1403,27 @@ def geo_search(q: str = ""):
              "country": g.get("country") or "",
              "lat": round(g["latitude"], 4),
              "lon": round(g["longitude"], 4),
+             "tz": g.get("timezone") or "",
              "name_url": urllib.parse.quote(g["name"])}
             for g in results]
     return render(GEO_T, q=q, hits=hits)
 
 
 @app.get("/geo/set")
-def geo_set(lat: float = 0.0, lon: float = 0.0, name: str = ""):
+def geo_set(lat: float = 0.0, lon: float = 0.0, tz: str = "", name: str = ""):
     if -90 <= lat <= 90 and -180 <= lon <= 180:
         CONFIG["location"]["lat"] = lat
         CONFIG["location"]["lon"] = lon
         CONFIG["location"]["place"] = name or f"{lat}, {lon}"
+        # tidszonen styr både Open-Meteos tidsstämplar och _now_label:
+        # index i prognosserien blir rätt oavsett containerns TZ
+        tz = (tz or "").strip()
+        if tz:
+            try:
+                ZoneInfo(tz)   # ogiltig tidszon förkastas tyst
+                CONFIG["location"]["tz"] = tz
+            except Exception:
+                pass
         save_config(CONFIG)
     return RedirectResponse("/setup", status_code=303)
 
@@ -1249,8 +1455,11 @@ async def setup_post(request: Request):
         CONFIG["location"]["lon"] = float(f.get("lon"))
     except (TypeError, ValueError):
         pass  # ogiltig position ignoreras, konfig behålls
+    old_topics = dict(CONFIG["topics"])
     for role in ROLES:
         CONFIG["topics"][role] = f.get(f"topic_{role}", "").strip()
+    if CONFIG["topics"] != old_topics:
+        mqtt_changed = True   # nya rollkopplingar: prenumerera om NU
     save_config(CONFIG)
     if mqtt_changed:
         _mqtt_rebuild.set()
@@ -1354,3 +1563,4 @@ if __name__ == "__main__":
     threading.Thread(target=weather_loop, daemon=True).start()
     threading.Thread(target=control_loop, daemon=True).start()
     uvicorn.run(app, host="0.0.0.0", port=WEB_PORT, log_level="warning")
+

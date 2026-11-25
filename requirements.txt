@@ -1,6 +1,8 @@
 fastapi
 uvicorn
 jinja2
+markupsafe
+tzdata
 paho-mqtt>=2.1,<3
 requests
 python-multipart

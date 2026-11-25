@@ -31,6 +31,17 @@ always know why the signal moves.
 **Influence** = Inject minus real outdoor temperature, the same vocabulary as
 Ngenic Tune, so both can run in parallel all winter for A/B comparison.
 
+Optionally, a self-learning room controller (`auto`, off by default) nudges
+Inject toward a target room temperature: a P-term on the filtered room error,
+a learned bias per wind-chill band (slow integral), and a fast inner loop on
+the measured district-heating power. **Sign convention (v0.18)**: a positive
+correction means *increase heat demand* and is applied as `Inject − corr`,
+because the substation's heating curve is falling: a higher faked outdoor
+temperature means less heat. Balance learning and the power loop are paused
+during tap-water stops (config `auto.power_skip_kw` / `auto.flow_skip_lh`:
+measured tap stops peak at 17–33 kW / 660–1020 l/h vs normal radiator load
+p95 = 7.2 kW).
+
 ## Features
 
 - **Single Python file** (`app.py`) with everything: MQTT, weather, brain, web UI, logging
@@ -40,7 +51,7 @@ Ngenic Tune, so both can run in parallel all winter for A/B comparison.
   *Prognosändring*, *Mode* (names in the UI are Swedish)
 - **Weather from [Open-Meteo](https://open-meteo.com)** (no API key), polled every
   30 minutes: temperature, wind, shortwave radiation, cloud cover
-- **Wind chill (EC appparent temperature) computed internally**, both for now and
+- **Wind chill (EC apparent temperature) computed internally**, both for now and
   for the whole forecast series: no weather API ships wind chill as a forecast
 - **Built-in city search** (Open-Meteo geocoding): pick your position at
   `http://<host>:8080` and the forecast follows you, anywhere on the planet
@@ -98,6 +109,16 @@ Sensors appear automatically via MQTT discovery. Home assistant entities that
 lack an MQTT topic (SMHI outdoor temperature, template sensors, radiator
 thermostats) can be streamed onto the bus with one automation: see
 [`examples/ha_stream_automation.yaml`](examples/ha_stream_automation.yaml).
+
+## Development
+
+The regulation brain is pure functions (`compute_inject`, `auto_regulate`,
+`apply_regulation`) so it can be tested without a broker, web server or
+network (heavy frameworks are stubbed automatically):
+
+```bash
+python3 tests/test_regulator.py    # or: pytest tests -q
+```
 
 ## Security notes
 
