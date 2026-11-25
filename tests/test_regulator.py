@@ -268,6 +268,20 @@ def test_regulate_stale_indoor():
     assert reg is None
 
 
+def test_regulate_indoor_as_samples_dict():
+    # Regression v0.18.1: control_loop skickade samples-posten som dict
+    # ({"ts", "value"}) -> KeyError: 0 varje varv när auto slog på.
+    now = time.time()
+    indoor = {"ts": now, "value": 20.0, "topic": "zigbee2mqtt/Vardagsrummet"}
+    hist = [(now - 1800, 20.0), (now - 60, 20.0)]
+    reg, _ = app.auto_regulate(_auto(setpoint_c=21.5), indoor, hist,
+                               -5.0, None, None, now, 0)
+    assert reg is not None and reg["err"] == 1.5    # som tupelfallet
+    reg2, _ = app.auto_regulate(_auto(setpoint_c=21.5), (now, 20.0), hist,
+                                -5.0, None, None, now, 0)
+    assert reg2["corr"] == reg["corr"]              # identiskt resultat
+
+
 def test_regulate_without_kold():
     reg, dirty = _reg(_auto(), kold=None)
     assert reg is None
