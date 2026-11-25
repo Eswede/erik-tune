@@ -741,6 +741,10 @@ def auto_regulate(a, indoor, ar_hist, kold, pw, flow_lh, now, last_learn):
     """
     if a.get("enabled") != "on":
         return None, False
+    if isinstance(indoor, dict):
+        # samples-post ({"ts", "value", ...}) accepteras: normalisera till
+        # tupeln (ts, value) som resten av funktionen är kontrakterad för.
+        indoor = (indoor.get("ts"), indoor.get("value"))
     if not indoor or now - indoor[0] > int(a["sample_max_age_s"]):
         return None, False
     if kold is None:
@@ -850,7 +854,11 @@ def control_loop():
 
             # Regulatorn: ren funktion, all historik skickas som argument.
             a = CONFIG["auto"]
+            # samples-post {"ts","value"}: auto_regulate vill ha tupel
+            # (ts, value). v0.18 skickade dicten rakt av -> KeyError: 0
+            # så fort självlärande reglering slogs på (allt annat körde ok).
             indoor = samples.get("indoor_temp_c")
+            indoor = (indoor["ts"], indoor["value"]) if indoor else None
             pwrec = samples.get("fjv_power_kw")
             flrec = samples.get("fjv_flow_lh")
             pw = (pwrec["value"] if pwrec and
