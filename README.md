@@ -38,9 +38,16 @@ the measured district-heating power. **Sign convention (v0.18)**: a positive
 correction means *increase heat demand* and is applied as `Inject − corr`,
 because the substation's heating curve is falling: a higher faked outdoor
 temperature means less heat. Balance learning and the power loop are paused
-during tap-water stops (config `auto.power_skip_kw` / `auto.flow_skip_lh`:
-measured tap stops peak at 17–33 kW / 660–1020 l/h vs normal radiator load
-p95 = 7.2 kW).
+during tap-water stops. **DHW gate (v0.19)**: the primary tap indicator is
+the wmbus tap-water meter (`auto.tapflow_skip_m3h`, radiator load reads 0);
+the primary-flow test (`auto.flow_skip_lh`) is retired after deep-cold
+radiator flow (300–340 l/h) caused an hour of false tap stops, and fjv power
+> `auto.power_skip_kw` (17–33 kW peaks vs radiator p95 = 7.2 kW) remains as
+backup. The inner power loop never opposes the room error (direction guard,
+v0.19), and learning is paused during events the radiators cannot explain:
+room-temperature slope beyond `auto.learn_slope_max_c_h` (open window /
+fireplace) and district-heating network faults detected as a T1 dip beyond
+`auto.netfault_drop_c` under the hourly median.
 
 ## Features
 

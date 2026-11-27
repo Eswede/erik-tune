@@ -48,6 +48,25 @@ v0.18 (efter extern kodgranskning 24/11 2026):
 - Webb: jinja2 autoescape=True; betrodd intern HTML wrappas i Markup().
 - compute_inject/auto_regulate är rena funktioner (testdata som arg) =>
   testbar utan MQTT/FastAPI (se tests/test_regulator.py).
+
+v0.19 (27/11 2026, efter tre dygn skarp drift i kylan):
+- DHW-GATE BYTER INDIKATOR: primär tappindikator är wmbus-tappvattenflödet
+  (tapwater_flow_m3h > tapflow_skip_m3h, radiatordrift = 0); fjv-effekt >
+  power_skip_kw är backup. Primärflödestestet (flow_skip_lh) PENSIONERAS:
+  i djupkyla 26/11 körde ren radiatorlast 300-340 l/h vilket gav 57 min
+  falska tappstopp (10:08-11:05) med fruset p_bal och logspam.
+- RIKTNINGSSÄKRAD INNERSLINGA: corr_p fär inte motarbeta rumsfelet
+  (26/11 06:50: corr_p ca -0,85 upphävde bias+P ca +0,72 medan huset låg
+  0,5 C under börvärdet). err > dödband => corr_p >= 0,
+  err < -dödband => corr_p <= 0. Innerslingan behåller sin roll i dödbandet.
+- LUTNINGSVAKT (vädring/kamin): |lutning| på RÅ rumstemp över
+  learn_slope_max_c_h pausar bias- och balansinlärning tills fältet lugnat
+  sig: husets tidskonstant ~48 h, så snabba lutningar är vädring (fallande)
+  eller kamin/ugn (stigande), inte radiatorreglering. Lär bara i
+  kvasi-jämvikt. P-ledet körs vidare under händelsen (det ska det).
+- NÄTFELSVAKT: sjunker T1 mer än netfault_drop_c under senaste timmens
+  median (Borlänge-nätfel 26/11 kl 05: 74 -> 66,5 C, "effekt 1,3 kW" i
+  loggen) pausas inlärningen: felet är nätets, inte husets.
 """
 
 import html
@@ -139,13 +158,19 @@ DEFAULT_CONFIG = {
         "band_size": 5,          # köldfaktorbandens bredd, °C
         "power_gain": 0.5,       # grader inject per kW effectgap (snabb innerslinga)
         "power_max_age_s": 900,  # effectvandet far vara max 15 min gammalt
-        # DHW-gate (beslut 24/11): tappstopp >10 kW uppmätta, normal radiatorlast
-        # p95 = 7,2 kW. Blir effekt ELLER flöde över trösklarna: hoppa över
-        # balansinlärning och stäng effekt-korrigeringen (corr_p = 0) - annars
-        # lär regulatorn in duschar som "balanseffekt" per köld-band och driver
-        # inject fel vid ren radiatorlast.
-        "power_skip_kw": 8.0,    # kW: över = tappstopp, effekt-regleringen pausas
-        "flow_skip_lh": 300.0,   # l/h primärt flöde: över = dubbelkontroll tappstopp
+        # DHW-gate v0.19: primär indikator är wmbus-tappvattenflödet
+        # (tapwater_flow_m3h: radiatordrift = 0, dusch = 0,3-1,1 m3/h).
+        # Backup: fjv-effekt > power_skip_kw. Primärflödestestet PENSIONERAS:
+        # djukkyla 26/11 körde ren radiatorlast (5,5-8,2 kW) med 300-340 l/h
+        # => 57 min falska tappstopp. Nya nycklar backfills automatiskt av
+        # load_config till gamla config.json.
+        "tapflow_skip_m3h": 0.05,  # m3/h tappvatten: över = tappstopp
+        "power_skip_kw": 8.0,    # kW fjv-effekt: över = backup-tappstopp
+        "flow_skip_lh": 300.0,   # PENSIONERAD i v0.19 (läses inte längre)
+        # Händelsevakter v0.19: regulatorn lär bara i kvasi-jämvikt
+        "slope_window_s": 2700,     # lutningsfönster på RÅ rumstemp (45 min)
+        "learn_slope_max_c_h": 0.3, # |lutning| över => vädring/kamin pausar lärandet
+        "netfault_drop_c": 5.0,     # T1-dipp under timmedian => nätfel pausar lärandet
         # Frön från årsdata (5 552 h dec25-nov26, Tin ~21,4 C): matad effekt
         # per köldfaktorband, justerat ~+2,5 C (kold är vindkylt vs ute),
         # inkl varmvatten ~1,2 kW som golv. EMA (0.9/0.1) rätar fröna mot
@@ -720,7 +745,40 @@ def compute_inject(ute, w=None, p=None):
     return inject, round(inject - ute, 2)
 
 
-def auto_regulate(a, indoor, ar_hist, kold, pw, flow_lh, now, last_learn):
+def _slope_c_h(hist, now, window_s):
+    """Lutning (C/h) på RÅ rumstemp inom fönstret; None om för lite data.
+    Husets tidskonstant är ~48 h: lutningar vida över learn_slope_max_c_h
+    är vädring (fallande) eller kamin/ugn (stigande), inte radiatorreglering."""
+    pts = [(ts, v) for ts, v in (hist or []) if now - ts <= int(window_s)]
+    if len(pts) < 3 or now - pts[0][0] < int(window_s) / 3:
+        return None
+    t0 = pts[0][0]
+    xs = [(ts - t0) / 3600.0 for ts, _ in pts]
+    ys = [v for _, v in pts]
+    n = float(len(xs))
+    mx_ = sum(xs) / n
+    my = sum(ys) / n
+    num = sum((x - mx_) * (y - my) for x, y in zip(xs, ys))
+    den = sum((x - mx_) ** 2 for x in xs)
+    return num / den if den > 1e-9 else 0.0
+
+
+def _t1_netfault(t1_hist, now, drop_c, window_s=3600):
+    """T1-dipp: senaste T1 ligger mer än drop_c under timmens median (exkl.
+    sista värdet) => returnerar dippen i C, annars None. Nätfel i
+    fjv-nätet (Borlänge 26/11 kl 05: 74 -> 66,5 C) ska inte läras som
+    husets underskott."""
+    pts = [(ts, v) for ts, v in (t1_hist or []) if now - ts <= int(window_s)]
+    if len(pts) < 4 or now - pts[0][0] < 1800:
+        return None
+    rest = sorted(v for _, v in pts[:-1])
+    med = rest[len(rest) // 2]
+    dip = med - pts[-1][1]
+    return round(dip, 2) if dip >= float(drop_c) else None
+
+
+def auto_regulate(a, indoor, ar_hist, kold, pw, flow_lh, now, last_learn,
+                  tapflow=None, t1_hist=None):
     """
     REN FUNKTION (testbar utan MQTT/DB): självlärande rumsreglering (är/bör)
     med P-led på felet + lärt bias per köldfaktorband + snabb effekt-innerslinga.
@@ -731,6 +789,9 @@ def auto_regulate(a, indoor, ar_hist, kold, pw, flow_lh, now, last_learn):
       kold:       köldfaktor (fallboll prognostemp): bandindex
       pw, flow_lh: fjv-effekt kW / primärflöde l/h; kan vara None. Anroparen
                   skickar bara FÄRSKA värden (< power_max_age_s).
+      tapflow:    tappvattenflöde m3/h (wmbus), färskt eller None: primär
+                  tappindikator för DHW-grinden (v0.19)
+      t1_hist:    [(ts, value)] RÅ T1-serie senaste timmen, för nätfelsvakten
       now:        epoch-sekunder; last_learn: epoch för senaste lärtillfälle
     Return: (reg, dirty). reg=None => reglering av / inga färska data.
     dirty=True <=> bands/p_bal uppdaterats (då sparar control_loop config).
@@ -771,19 +832,27 @@ def auto_regulate(a, indoor, ar_hist, kold, pw, flow_lh, now, last_learn):
     dirty = False
     hold = abs(err) <= float(a["deadband_c"])
 
-    # DHW-gate: tappstopp ger effekttoppar 17-33 kW/660-1020 l/h (nov-data)
-    # medan normal radiatorlast ligger under ~7,2 kW. Blir effekt ELLER flöde
-    # över tröskeln: hoppa över balansinlärning OCH sätt corr_p=0, annars
-    # lär regulatorn in duschar som balanseffekt per köld-band.
-    pw_tap = ((pw is not None and pw > float(a.get("power_skip_kw", 8.0)))
-              or (flow_lh is not None
-                  and flow_lh > float(a.get("flow_skip_lh", 300.0))))
+    # DHW-gate v0.19: primär indikator är wmbus-tappvattenflödet (läser 0
+    # vid ren radiatorlast); backup är fjv-effekten. Primärflödestestet är
+    # pensionerat (falska tappstopp i djupkyla 26/11, se changelog).
+    pw_tap = ((tapflow is not None and
+               tapflow > float(a.get("tapflow_skip_m3h", 0.05)))
+              or (pw is not None and pw > float(a.get("power_skip_kw", 8.0))))
+
+    # Händelsevakter v0.19: lär bara i kvasi-jämvikt.
+    slope = _slope_c_h(ar_hist, now, int(a.get("slope_window_s", 2700)))
+    slope_hold = (slope is not None
+                  and abs(slope) > float(a.get("learn_slope_max_c_h", 0.3)))
+    t1_dip = _t1_netfault(t1_hist, now, float(a.get("netfault_drop_c", 5.0)))
+    net_hold = t1_dip is not None
+    event_hold = slope_hold or net_hold
 
     # Innerslinga: effekt (kW) är snabbare än rumstempen (minuter mot
     # timmar). När huset ligger rätt lär vi bandets balanseffekt
     # (EMA 0.9/0.1); när det avviker driver effektgapet regleringen direkt.
     corr_p = 0.0
-    if pw is not None and not pw_tap and float(a["power_gain"]) > 0:
+    if (pw is not None and not pw_tap and float(a["power_gain"]) > 0
+            and not event_hold):
         if hold:
             if key not in a["p_bal"]:      # nytt band i frötabellen = spara
                 dirty = True
@@ -795,18 +864,27 @@ def auto_regulate(a, indoor, ar_hist, kold, pw, flow_lh, now, last_learn):
         elif key in a["p_bal"]:
             corr_p = max(-mx, min(mx,
                 float(a["power_gain"]) * (float(a["p_bal"][key]) - pw)))
+            # v0.19 riktningssäkring: innerslingan fär inte motarbeta
+            # rumsfelet (26/11: corr_p -0,85 upphävde bias+P ca +0,72 medan
+            # huset låg 0,5 C under börvärdet). Bara samma riktning som err;
+            # innerslingan är fri som vanligt när felet är inom dödbandet.
+            if err > float(a["deadband_c"]):
+                corr_p = max(corr_p, 0.0)
+            elif err < -float(a["deadband_c"]):
+                corr_p = min(corr_p, 0.0)
 
     if hold:
         return {"err": 0.0, "corr": round(bias, 2), "band": band,
                 "ar_c": round(ar, 2), "bor_c": bor, "bias": round(bias, 3),
                 "new_bias": round(bias, 3), "learned": False,
                 "learn_ts": last_learn, "hold": True, "pw": pw,
-                "flow_lh": flow_lh, "pw_tap": pw_tap,
-                "corr_p": 0.0}, dirty    # dödband: håll minnet
+                "flow_lh": flow_lh, "pw_tap": pw_tap, "tapflow": tapflow,
+                "corr_p": 0.0, "slope": slope, "slope_hold": slope_hold,
+                "t1_dip": t1_dip, "net_hold": net_hold}, dirty  # dödband
     corr = max(-mx, min(mx, bias + float(a["k_p"]) * err + corr_p))
     new_bias = bias
     learned = False
-    if now - last_learn >= int(a["learn_interval_s"]):
+    if now - last_learn >= int(a["learn_interval_s"]) and not event_hold:
         new_bias = max(-mx, min(mx, bias + float(a["learn_rate"]) * err))
         a["bands"][key] = round(new_bias, 3)
         learned = True
@@ -816,7 +894,10 @@ def auto_regulate(a, indoor, ar_hist, kold, pw, flow_lh, now, last_learn):
             "ar_c": round(ar, 2), "bor_c": bor, "bias": round(bias, 3),
             "new_bias": round(new_bias, 3), "learned": learned,
             "learn_ts": last_learn, "pw": pw, "flow_lh": flow_lh,
-            "pw_tap": pw_tap, "corr_p": round(corr_p, 2)}, dirty
+            "pw_tap": pw_tap, "tapflow": tapflow,
+            "corr_p": round(corr_p, 2), "slope": slope,
+            "slope_hold": slope_hold, "t1_dip": t1_dip,
+            "net_hold": net_hold}, dirty
 
 
 
@@ -861,6 +942,10 @@ def control_loop():
             indoor = (indoor["ts"], indoor["value"]) if indoor else None
             pwrec = samples.get("fjv_power_kw")
             flrec = samples.get("fjv_flow_lh")
+            tfrec = samples.get("tapwater_flow_m3h")
+            tapflow = (tfrec["value"] if tfrec and
+                       time.time() - tfrec["ts"] <= int(a["power_max_age_s"])
+                       else None)
             pw = (pwrec["value"] if pwrec and
                   time.time() - pwrec["ts"] <= int(a["power_max_age_s"]) else None)
             flow_lh = (flrec["value"] if flrec and
@@ -869,10 +954,15 @@ def control_loop():
             kold = w.get("koldfaktor_c")
             if kold is None:
                 kold = w.get("temp_c")   # fallboll: prognostemp som bandindex
-            # RÅ rumstemp ur databasen (inte ar_c: rekursivt filter i v0.17)
-            ar_hist = read_series("indoor_temp_c", int(a["avg_window_s"]))
+            # RÅ rumstemp ur databasen (inte ar_c: rekursivt filter i v0.17);
+            # lutningsvakten vill ha slope_window_s, nätfelsvakten T1-serien.
+            hist_win = max(int(a["avg_window_s"]),
+                           int(a.get("slope_window_s", 2700)))
+            ar_hist = read_series("indoor_temp_c", hist_win)
+            t1_hist = read_series("t1_c", 3600)
             reg, dirty = auto_regulate(a, indoor, ar_hist, kold, pw, flow_lh,
-                                       time.time(), last_learn)
+                                       time.time(), last_learn,
+                                       tapflow=tapflow, t1_hist=t1_hist)
             if reg is not None:
                 with _lock:
                     _state["last_learn"] = reg["learn_ts"]
@@ -883,13 +973,43 @@ def control_loop():
                         + (f", effekt {reg['pw']} kW"
                            if reg["pw"] is not None else ""))
                 if reg["pw_tap"]:
+                    # detaljerna i meddelandet är de färska värdena; log_change
+                    # dedupar på hela strängen, så EN rad per pass räcker.
+                    det = [p for p in (
+                        f"effekt {reg['pw']} kW" if reg["pw"] is not None
+                        else None,
+                        f"flöde {reg['flow_lh']} l/h" if reg["flow_lh"] is not
+                        None else None,
+                        f"tappvatten {reg.get('tapflow')} m3/h"
+                        if reg.get("tapflow") is not None else None,
+                    ) if p]
                     log_change("tap",
-                               f"tappstopp: effekt {reg['pw']} kW / "
-                               f"flöde {reg['flow_lh']} l/h - "
-                               "balansinlärning och effekt-korrigeringen pausad")
+                               "tappstopp: " + " / ".join(det)
+                               + " - balansinlärning och "
+                               "effekt-korrigeringen pausad")
+                elif reg.get("net_hold"):
+                    # VÄRDESTABILT meddelande (t1_dip varierar varje cykel;
+                    # log_change dedupar på strängen => EN rad per fel).
+                    log_change("net",
+                               "inlärning pausad: fjv-nätfel? T1 mer än "
+                               f"{a.get('netfault_drop_c', 5.0)} C under "
+                               "timmedian - bias och balanseffekt lär inte "
+                               "under felet")
+                elif reg.get("slope_hold"):
+                    # VÄRDESTABILT meddelande (slope varierar varje cykel);
+                    # ny rad först om riktningen växlar fallande/stigande.
+                    log_change("slope",
+                               "inlärning pausad: "
+                               + ("vädring? rumstemp faller"
+                                  if (reg.get("slope") or 0) < 0
+                                  else "kamin/ugn? rumstemp stiger")
+                               + f" mer än "
+                               f"{a.get('learn_slope_max_c_h', 0.3)} C/h - "
+                               "bias och balanseffekt lär inte under händelsen")
                 else:
                     with _log_lock:
-                        _log_states.pop("tap", None)   # tappstopps-läget läkt
+                        for k in ("tap", "net", "slope"):
+                            _log_states.pop(k, None)   # lägena läkta
 
             if inject_c is not None and reg is not None:
                 inject_c, influence_c = apply_regulation(
