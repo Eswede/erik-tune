@@ -55,7 +55,9 @@ fireplace) and district-heating network faults detected as a T1 dip beyond
 - **MQTT with Home Assistant auto-discovery**: sensors appear under the device
   "Erik Tune": *Injected Outdoor*, *Influence*, *Köldfaktor* (wind chill now),
   *Köldfaktorprognos* (wind chill at horizon), *Solinstrålning*, *Prognostemp*,
-  *Prognosändring*, *Mode* (names in the UI are Swedish)
+  *Prognosändring*, *Mode*, plus the raw sensors *Utetemperatur*,
+  *Rumstemperatur*, *Rumstemp filtrerad* and *Börvärde* (names in the UI are
+  Swedish)
 - **Weather from [Open-Meteo](https://open-meteo.com)** (no API key), polled every
   30 minutes: temperature, wind, shortwave radiation, cloud cover
 - **Wind chill (EC apparent temperature) computed internally**, both for now and
@@ -83,6 +85,10 @@ fireplace) and district-heating network faults detected as a T1 dip beyond
 | `erik-tune/solar/wm2` | int | Shortwave radiation |
 | `erik-tune/forecast/temp_c` | float | Forecast temperature at horizon |
 | `erik-tune/forecast/drop_c` | float | Forecast temp − current temp |
+| `erik-tune/ute/temp_c` | float, retain | Outdoor temp actually used (MQTT role or Open-Meteo fallback) |
+| `erik-tune/room/temp_c` | float, retain | Raw indoor temp from the configured indoor role |
+| `erik-tune/room/ar_c` | float, retain | Regulator's filtered room temp (30-min mean) |
+| `erik-tune/room/bor_c` | float, retain | The setpoint the regulator aims at |
 
 Subscribable roles (configured in the UI): outdoor temperature, indoor
 temperature, heating supply/return (T1/T2), district heating flow (l/h), power

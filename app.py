@@ -394,6 +394,14 @@ def publish_discovery(client):
          "erik-tune/forecast/koldfaktor_c", "°C", "temperature"),
         ("erik_tune_mode", "Erik Tune Mode",
          "erik-tune/mode", None, None),
+        ("erik_tune_ute_temp_c", "Erik Tune Utetemperatur",
+         "erik-tune/ute/temp_c", "°C", "temperature"),
+        ("erik_tune_room_temp_c", "Erik Tune Rumstemperatur",
+         "erik-tune/room/temp_c", "°C", "temperature"),
+        ("erik_tune_room_ar_c", "Erik Tune Rumstemp filtrerad",
+         "erik-tune/room/ar_c", "°C", "temperature"),
+        ("erik_tune_room_bor_c", "Erik Tune Börvärde",
+         "erik-tune/room/bor_c", "°C", "temperature"),
     ]
     for uid, name, topic, uom, dc in items:
         cfg = json.loads(discovery_cfg(uid, name, topic, uom, dc))
@@ -1010,6 +1018,17 @@ def control_loop():
                     with _log_lock:
                         for k in ("tap", "net", "slope"):
                             _log_states.pop(k, None)   # lägena läkta
+
+            # v0.19: råa givare ut på MQTT (HA-discovery). ute är temperaturen
+            # regleringen FAKTISKT använder (MQTT-topic el. Open-Meteo-fallboll),
+            # inne är den konfigurerade inne-rollens senaste värde. Publiceras
+            # varje cykel oavsett om auto/inject är på, så HA-graferna syns alltid.
+            if ute_now is not None:
+                client.publish("erik-tune/ute/temp_c", round(ute_now, 2),
+                               retain=True, qos=1)
+            if indoor is not None:
+                client.publish("erik-tune/room/temp_c", indoor[1],
+                               retain=True, qos=1)
 
             if inject_c is not None and reg is not None:
                 inject_c, influence_c = apply_regulation(
