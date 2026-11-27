@@ -844,6 +844,26 @@ def test_endpoints_smoke():
         app.CONFIG["mqtt"], app.CONFIG["topics"], app._state["samples"] = saved
 
 
+def test_discovery_includes_givare_v019():
+    # v0.19: inne-/utegivare + rum/ar_c/bor_c skall ha HA-discovery-config
+    PUBLISHED.clear()
+    app.publish_discovery(_ClientStub())
+    cfgs = {t: json.loads(p) for t, p in PUBLISHED
+            if t.startswith("homeassistant/sensor/")}
+    for uid, topic in (("erik_tune_ute_temp_c", "erik-tune/ute/temp_c"),
+                       ("erik_tune_room_temp_c", "erik-tune/room/temp_c"),
+                       ("erik_tune_room_ar_c", "erik-tune/room/ar_c"),
+                       ("erik_tune_room_bor_c", "erik-tune/room/bor_c")):
+        c = cfgs[f"homeassistant/sensor/{uid}/config"]
+        assert c["state_topic"] == topic
+        assert c["device_class"] == "temperature" and c["unit_of_measurement"] == "°C"
+        assert c["device"]["identifiers"] == ["erik-tune"]
+    # hela upplagan: 13 sensorer + 2 number-sliders
+    assert len(cfgs) == 13
+    assert sum(1 for t, _ in PUBLISHED
+               if t.startswith("homeassistant/number/")) == 2
+
+
 # ---------------------------------------------------------------------------
 # Runner (pytest plockar upp samma funktioner automatiskt)
 # ---------------------------------------------------------------------------
