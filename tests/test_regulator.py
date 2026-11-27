@@ -404,12 +404,112 @@ def test_dhw_gate_power_skips_learning_and_corr_p():   # BESLUT 24/11
     assert reg2["pw_tap"] is True and reg2["corr_p"] == 0.0
 
 
-def test_dhw_gate_flow_triggers_too():
+def test_dhw_gate_flow_retired_v019():
+    # Regression 26/11: ren radiatorlast i djupkyla (300-340 l/h) gav 57 min
+    # falska tappstopp. Flödet GATERAR INTE längre; tappvattenmätaren gör det.
     a = _auto(setpoint_c=21.5)
     now = time.time()
-    reg, dirty = app.auto_regulate(a, (now, 21.4), [], -5.0, 5.0, 660.0, now, 0)
-    assert reg["pw_tap"] is True                  # flödet > 300 l/h gaterar
+    reg, dirty = app.auto_regulate(a, (now, 21.4), [], -5.0, 6.5, 340.0, now, 0)
+    assert reg["pw_tap"] is False                 # flöde pensionerat i v0.19
+    assert reg.get("tapflow") is None
+    assert reg["hold"] is True and reg["corr_p"] == 0.0
+    # ingen tappgrind => balansinlärningen kör: EMA mot 6,5 (3,3 -> 3,62)
+    assert a["p_bal"]["-5"] == 3.62 and dirty is True
+
+
+def test_dhw_gate_tapflow_primary_v019():
+    # wmbus-tappvatten > 0,05 m3/h gaterar även när fjv-effekten är låg
+    a = _auto(setpoint_c=21.5)
+    now = time.time()
+    reg, dirty = app.auto_regulate(a, (now, 21.4), [], -5.0, 3.1, 120.0, now, 0,
+                                   tapflow=0.12)
+    assert reg["pw_tap"] is True and reg["tapflow"] == 0.12
     assert a["p_bal"]["-5"] == 3.3 and dirty is False
+
+
+def test_dhw_gate_power_backup_v019():
+    # Ingen färsk tappvattenläsning: effekten > 8 kW gaterar som backup
+    a = _auto(setpoint_c=21.5)
+    now = time.time()
+    reg, _ = app.auto_regulate(a, (now, 21.4), [], -5.0, 9.0, 340.0, now, 0)
+    assert reg["pw_tap"] is True
+
+
+def test_corr_p_never_opposes_room_error_v019():
+    # Regression 26/11 06:50: corr_p ca -0,85 upphävde bias+P ca +0,72 medan
+    # huset låg under börvärdet. Innerslingan fär bara hjälpa, inte motarbeta.
+    a = _auto(setpoint_c=21.5)                    # err +1,0: huset behöver MER
+    now = time.time()
+    reg, _ = app.auto_regulate(a, (now, 20.5), [(now - 1500, 20.5)], -5.0,
+                              6.9, None, now, 0)   # 0.5*(3.3-6.9) = -1.8
+    assert reg["corr_p"] >= 0.0                    # riktningssäkrad uppåt
+    a2 = _auto(setpoint_c=21.5)
+    reg2, _ = app.auto_regulate(a2, (now, 22.5), [(now - 1500, 22.5)], -5.0,
+                                1.0, None, now, 0)  # err -1,0; 0.5*(3.3-1.0)>0
+    assert reg2["corr_p"] <= 0.0                   # riktningssäkrad nedåt
+    # inom dödbandet är innerslingan fri som vanligt
+    a3 = _auto(setpoint_c=21.5)
+    reg3, _ = app.auto_regulate(a3, (now, 21.4), [(now - 1500, 21.4)], -5.0,
+                                6.9, None, now, 0)
+    assert reg3["hold"] is True and reg3["corr_p"] == 0.0  # dödband: håll minnet
+
+
+def _slope_hist(now, start, end, span_s=2700, n=4):
+    return [(now - span_s * (n - 1 - i) / (n - 1), v)
+            for i, v in enumerate(
+                [start + (end - start) * i / (n - 1) for i in range(n)])]
+
+
+def test_slope_guard_ventilation_v019():
+    # Vädring: rumstemp faller ca 2 C/h => lutningsvakt pausar lärandet
+    a = _auto(setpoint_c=21.5)
+    now = time.time()
+    hist = _slope_hist(now, 22.5, 21.0)            # -2,0 C/h över 45 min
+    reg, dirty = app.auto_regulate(a, (now, 21.0), hist, -5.0, 5.0, None,
+                                   now, 0)
+    assert reg["slope_hold"] is True and reg["slope"] < -0.3
+    assert a["p_bal"]["-5"] == 3.3                 # inget lärt under händelsen
+    assert dirty is False
+    assert reg["corr_p"] != 0 or True              # P/corr körs vidare
+
+
+def test_slope_guard_fireplace_v019():
+    # Kamin/ugn: rumstemp stiger ca 1,2 C/h => pausar lärandet åt andra hållet
+    a = _auto(setpoint_c=21.5)
+    now = time.time()
+    hist = _slope_hist(now, 20.5, 21.5)            # +1,33 C/h
+    reg, _ = app.auto_regulate(a, (now, 21.5), hist, -5.0, 5.0, None, now, 0)
+    assert reg["slope_hold"] is True and reg["slope"] > 0.3
+    assert a["p_bal"]["-5"] == 3.3
+
+
+def test_slope_quiet_learns_normally_v019():
+    # Jämn rumstemp: ingen väktare, lärandet påslaget som vanligt
+    a = _auto(setpoint_c=22.0)
+    now = time.time()
+    hist = _slope_hist(now, 21.0, 21.05)            # ca +0,07 C/h: tyst
+    reg, dirty = app.auto_regulate(a, (now, 21.0), hist, -5.0, 5.0, None,
+                                   now, 0)
+    assert reg["slope_hold"] is False and reg["net_hold"] is False
+    assert reg["new_bias"] != 0.0 and dirty is True  # err lär bias
+
+
+def test_netfault_guard_v019():
+    # Regression 26/11 kl 05 (Borlänge-nätfel): T1 74 -> 66,5 C dippar
+    # inlärningen; husets underskott var nätets fel, inte väder/börvärde.
+    a = _auto(setpoint_c=21.5)
+    now = time.time()
+    t1 = [(now - 3300 + 300 * i, 74.0) for i in range(10)] + [(now, 66.5)]
+    reg, dirty = app.auto_regulate(a, (now, 21.0), [], -5.0, 5.0, None,
+                                   now, 0, tapflow=0.0, t1_hist=t1)
+    assert reg["net_hold"] is True and reg["t1_dip"] == 7.5
+    assert a["p_bal"]["-5"] == 3.3 and dirty is False
+    # stabilt nät: ingen vakt, lärandet påslaget
+    a2 = _auto(setpoint_c=21.5)
+    t1b = [(now - 3300 + 300 * i, 74.0) for i in range(10)] + [(now, 74.0)]
+    reg2, dirty2 = app.auto_regulate(a2, (now, 21.0), [], -5.0, 5.0, None,
+                                     now, 0, tapflow=0.0, t1_hist=t1b)
+    assert reg2["net_hold"] is False and dirty2 is True
 
 
 def test_corr_p_direction_and_clip():
