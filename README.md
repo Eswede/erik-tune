@@ -70,6 +70,35 @@ fireplace) and district-heating network faults detected as a T1 dip beyond
   controlled. Switching to `active` mode is explicit, and the watchdog/failsafe
   lives on the ESP32 side (heartbeat timeout there parks the digipot at a fixed
   safe value)
+- **Mobile-first web UI (v0.20)**: dark theme with gold accents, hero card with
+  indoor/outdoor temperatures over a misty forest, setpoint quick buttons
+  (22.5/23.0/23.5°), fixed bottom navigation (Hem/Styrning/Topics/Inställningar)
+  and silent live updates every 15 s (`/api/state` + `static/app.js`): no page
+  reloads, no flicker
+- **Installable as an app (PWA)**: `static/manifest.webmanifest` + icons +
+  service worker. iOS Safari: *Lägg till hemskärmen* works directly over HTTP
+  on the LAN. Android Chrome shows the *Installera app* prompt only over
+  HTTPS: see *HTTPS on the LAN* below
+
+## HTTPS on the LAN (Android app install)
+
+Chrome on Android requires a secure context before it offers the
+"Installera app" banner. On plain `http://<pi>:8080` the manifest still makes
+"Lägg till på startskärmen" available, but it opens as a shortcut. To get the
+full prompt, serve the UI over HTTPS with a certificate your phone trusts:
+
+1. Create a small CA and a certificate for the Pi's hostname (e.g. with
+   `step-ca`, or `openssl` + your own CA)
+2. Put a reverse proxy (caddy/nginx) in front that terminates TLS for
+   `https://erik-tune.home.arpa` and proxies to `127.0.0.1:8080`, or pass
+   `--ssl-certfile/--ssl-keyfile` to uvicorn
+3. Install the CA certificate on the phone once
+   (Settings → Security → Install certificate)
+4. Open `https://…`, the padlock appears, and Chrome's menu offers
+   *Installera app*
+
+Everything stays on the LAN: the web UI has **no authentication**, so never
+port-forward it and never expose the proxy publicly.
 
 ## MQTT contract
 
@@ -132,6 +161,11 @@ network (heavy frameworks are stubbed automatically):
 ```bash
 python3 tests/test_regulator.py    # or: pytest tests -q
 ```
+
+`static/` holds the PWA assets (manifest, service worker, icons, hero image)
+served by the `/static/{file}` route (extension allow-list, no path
+traversal). `tests/vendor/` carries pure-Python jinja2/markupsafe so the
+tests run on a bare Python with no extra packages.
 
 ## Security notes
 

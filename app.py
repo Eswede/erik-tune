@@ -67,6 +67,22 @@ v0.19 (27/11 2026, efter tre dygn skarp drift i kylan):
 - NÄTFELSVAKT: sjunker T1 mer än netfault_drop_c under senaste timmens
   median (Borlänge-nätfel 26/11 kl 05: 74 -> 66,5 C, "effekt 1,3 kW" i
   loggen) pausas inlärningen: felet är nätets, inte husets.
+
+v0.20 (28/11 2026, webbgränssnitt i Ngenic Tune-stil efter Eriks skärmbildar):
+- MOBILFÖRST-UI: mörkt tema (#121212/#2d2d2d, guldaccent), rundade kort,
+  fix bottennavigering (Hem/Styrning/Topics/Inställningar) som app-balk,
+  hero med bakgrundsbild och INNEGIVARE/UTOMHUS i stora tal (som Ngenic),
+  börvärdes-snabbknappar 22,5/23,0/23,5 + fri inmatning, större tryckytor,
+  16-px-inputs (inget zoom-hopp), safe-area-täckmarginal.
+- PWA: /static/manifest.webmanifest + ikoner 192/512 (maskable),
+  service worker (nätverk först, offline-cache), theme-color, apple-meta.
+  OBS: Chrome/Android visar "Installera app"-prompten bara över HTTPS;
+  på HTTP i LAN blir det en genväg. iOS "Lägg till hemskärmen" fungerar
+  direkt över HTTP. Cert-guide i README.
+- LIVE-UPPDATERING: /api/state (JSON) + app.js pollar var 15:e sekund och
+  uppdaterar hero/chips på plats; 30-s-meta-refresh borta (ingen blink).
+- Static delivereras av /static/{namn} (path-traversal-skyddad, vitlistade
+  filändelser). Fortfarande: ingen inloggning, LAN-internt, aldrig portforw.
 """
 
 import html
@@ -83,7 +99,8 @@ from zoneinfo import ZoneInfo
 import requests
 import paho.mqtt.client as mqtt
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import (HTMLResponse, RedirectResponse, JSONResponse,
+                               FileResponse)
 import uvicorn
 from jinja2 import Environment
 from markupsafe import Markup
@@ -1077,47 +1094,153 @@ def control_loop():
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
+# v0.20: mobil-först, Ngenic Tune-inspirerat mörkt tema (guldaccent).
 CSS = """
-body{font-family:system-ui,sans-serif;background:#12161c;color:#e7ecf2;max-width:1100px;margin:0 auto;padding:24px;color-scheme:dark}
-h1{font-size:1.5em}h2{font-size:1.1em;color:#9fb4cc;margin:24px 0 8px}
-.card{background:#1b2530;border-radius:10px;padding:14px 18px;margin:8px 0;display:flex;justify-content:space-between;align-items:baseline;gap:12px}
-.big{font-size:1.6em;font-weight:600}
-header a,a{color:#8ab4e8;text-decoration:none}
-header a{margin-right:14px}
+:root{--bg:#121212;--card:#2d2d2d;--line:#3f3f3f;--mut:#9e9e9e;--gold:#f5c518}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);
+color:#fff;margin:0;color-scheme:dark;padding-bottom:calc(78px + env(safe-area-inset-bottom))}
+header{display:flex;justify-content:space-between;align-items:center;gap:10px;
+max-width:1000px;margin:0 auto;padding:14px 16px 6px}
+header h1{font-size:1.05em;margin:0;letter-spacing:.12em;text-transform:uppercase;
+display:flex;align-items:center;gap:10px}
+main{max-width:1000px;margin:0 auto;padding:8px 14px 34px}
+h2{font-size:.85em;letter-spacing:.1em;text-transform:uppercase;color:var(--mut);
+margin:26px 4px 10px}
+.card{background:var(--card);border-radius:14px;padding:15px 17px;margin:8px 0;
+display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+.big{font-size:1.9em;font-weight:700;font-variant-numeric:tabular-nums}
+.lbl{color:var(--mut);font-size:.95em}
+.muted{color:var(--mut)}
+.warn{background:#3a2525}.ok{background:#25392b}
+code{background:#1e1e1e;padding:1px 5px;border-radius:4px}
+a{color:var(--gold);text-decoration:none}
+.hero{position:relative;border-radius:18px;overflow:hidden;margin:6px 0 12px;
+background:#1a1a1a;min-height:200px}
+.hero img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.hero .ov{position:absolute;inset:0;
+background:linear-gradient(180deg,rgba(8,8,8,.1) 30%,rgba(8,8,8,.82))}
+.hero .vals{position:relative;z-index:1;display:flex;flex-wrap:wrap;
+gap:6px 34px;padding:26px 22px 20px}
+.hero .v .t{font-size:.72em;letter-spacing:.14em;text-transform:uppercase;color:var(--mut)}
+.hero .v .n{font-size:2.7em;font-weight:700;line-height:1.05;font-variant-numeric:tabular-nums}
+.hero .v .n small{font-size:.33em;font-weight:500;color:var(--mut);letter-spacing:0}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:2px 0 4px}
+.chip{background:var(--card);border-radius:999px;padding:7px 14px;font-size:.85em;color:#ddd}
+.chip.ok{background:#25392b}.chip.warn{background:#3a2525}
+.dot{width:10px;height:10px;border-radius:50%;display:inline-block;background:var(--mut)}
+.dot.ok{background:#57c973}.dot.warn{background:#e05b4d}
+.setbtns{display:flex;gap:8px;width:100%}
+.setbtns form{flex:1}
+.setbtns button{width:100%;margin-top:0;font-size:1.3em;padding:15px 0;border-radius:12px}
+.setbtns button.cur{background:var(--gold);color:#141414}
 form{display:inline}
-label{display:block;margin:8px 0 2px;font-size:.9em;color:#9fb4cc}
-input,select{background:#243242;color:#e7ecf2;border:1px solid #3a4c60;border-radius:6px;padding:6px 8px;width:100%;box-sizing:border-box}
-table{border-collapse:collapse;width:100%}td,th{padding:6px 10px;border-bottom:1px solid #2a3a4c;text-align:left;vertical-align:top}
-button{background:#35639c;border:none;color:#fff;padding:8px 16px;border-radius:6px;margin-top:12px;cursor:pointer}
-.warn{background:#5a3535}.ok{background:#2e4a35}.muted{color:#7e93a8}
-code{background:#243242;padding:1px 5px;border-radius:4px}
+label{display:block;margin:12px 0 4px;font-size:.9em;color:var(--mut)}
+input,select{background:#1e1e1e;color:#fff;border:1px solid var(--line);
+border-radius:10px;padding:11px 12px;width:100%;font-size:16px}
+input:focus,select:focus{outline:2px solid var(--gold);outline-offset:-1px}
+button{background:var(--gold);color:#141414;border:none;border-radius:10px;
+padding:11px 18px;font-size:1em;font-weight:600;margin-top:10px;cursor:pointer}
+button.ghost{background:transparent;color:#fff;border:1px solid var(--line)}
+table{border-collapse:collapse;width:100%;display:block;overflow-x:auto}
+td,th{padding:8px 10px;border-bottom:1px solid #262626;text-align:left;vertical-align:top;white-space:nowrap}
+th{color:var(--mut);font-weight:600;font-size:.85em;text-transform:uppercase;letter-spacing:.06em}
+nav.bottom{position:fixed;left:0;right:0;bottom:0;z-index:20;background:#1a1a1a;
+border-top:1px solid #262626;display:flex;justify-content:space-around;
+padding:6px 0 calc(7px + env(safe-area-inset-bottom))}
+nav.bottom a{display:flex;flex-direction:column;align-items:center;gap:3px;
+color:var(--mut);font-size:.68em;letter-spacing:.03em;padding:6px 12px;border-radius:12px}
+nav.bottom a.act{color:var(--gold)}
+nav.bottom svg{width:23px;height:23px}
+@media(min-width:820px){
+ body{padding-bottom:0}
+ nav.bottom{position:static;border-top:0;background:transparent;
+  justify-content:flex-start;gap:4px;max-width:1000px;margin:0 auto;padding:6px 16px}
+ nav.bottom a{flex-direction:row;gap:8px;font-size:.85em}
+ main,header{padding-left:16px;padding-right:16px}
+}
 """
 
-BASE_T = """<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-{% if dash %}<meta http-equiv="refresh" content="30">{% endif %}
+BASE_T = """<!doctype html><html lang="sv"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#121212">
+<link rel="manifest" href="/static/manifest.webmanifest">
+<link rel="icon" href="/static/icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Erik Tune">
 <title>Erik Tune</title><style>{{ css }}</style></head><body>
-<header><h1>Erik Tune <span class="muted">egen värmestyrning</span></h1>
-<nav><a href="/">Dashboard</a><a href="/setup">MQTT &amp; topics</a>
-<a href="/topics">Topicutforskaren</a>
-<a href="/tuning">Tuning</a></nav></header>{{ body }}</body></html>"""
+<header><h1>Erik Tune
+<span class="dot {{ 'ok' if mqtt_ok else 'warn' }}" id="d-mqtt"
+title="MQTT {{ 'ansluten' if mqtt_ok else 'nere' }}"></span></h1></header>
+<main>{{ body }}</main>
+<nav class="bottom">
+<a href="/" class="{{ 'act' if active=='hem' }}">
+ <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+ stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l9-8 9 8v9a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z"/></svg>
+ <span>Hem</span></a>
+<a href="/tuning" class="{{ 'act' if active=='styrning' }}">
+ <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+ stroke-linecap="round"><path d="M4 7h9M19 7h1M4 17h1M11 17h9"/>
+ <circle cx="16" cy="7" r="2.2"/><circle cx="8" cy="17" r="2.2"/></svg>
+ <span>Styrning</span></a>
+<a href="/topics" class="{{ 'act' if active=='topics' }}">
+ <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+ stroke-linecap="round"><path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>
+ <span>Topics</span></a>
+<a href="/setup" class="{{ 'act' if active=='installningar' }}">
+ <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+ stroke-linecap="round"><circle cx="12" cy="12" r="3.2"/>
+ <path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2 2M16.7 16.7l2 2M18.7 5.3l-2 2M7.3 16.7l-2 2"/></svg>
+ <span>Inställningar</span></a>
+</nav>
+{% if dash %}<script src="/static/app.js" defer></script>{% endif %}
+</body></html>"""
 
 DASH_T = """
-<h2>Läge</h2>
-<div class="card {{ 'ok' if mqtt_ok else 'warn' }}">
- <span>MQTT {{ host }}: {{ 'ansluten' if mqtt_ok else err }}</span>
- <span class="big">{{ mode }}</span></div>
-<div class="card"><span>Väder-API Open-Meteo</span>
- <span class="muted">{{last_weather}}</span></div>
+<div class="hero">
+ <img src="/static/hero.svg" alt="">
+ <div class="ov"></div>
+ <div class="vals">
+  <div class="v"><span class="t">Innegivare</span>
+   <span class="n" id="v-ar">{{ ar }}<small> °C</small></span></div>
+  <div class="v"><span class="t">Utomhus</span>
+   <span class="n" id="v-ute">{{ ute }}<small> °C</small></span></div>
+ </div>
+</div>
+<div class="chips">
+ <span class="chip {{ 'ok' if mqtt_ok else 'warn' }}">MQTT {{ 'ansluten' if mqtt_ok else err }}</span>
+ <span class="chip">Läge: {{ mode }}</span>
+ <span class="chip {{ 'ok' if auto_on else 'warn' }}">Reglering {{ 'PÅ' if auto_on else 'AV' }}</span>
+ <span class="chip">Väder: {{ last_weather }}</span>
+</div>
+
+<h2>Ställ in temperatur</h2>
+<div class="setbtns">
+ <form method="post" action="/setpoint"><input type="hidden" name="v" value="22.5">
+  <button class="{{ 'cur' if bor|string == '22.5' }}">22,5°</button></form>
+ <form method="post" action="/setpoint"><input type="hidden" name="v" value="23.0">
+  <button class="{{ 'cur' if bor|string == '23.0' }}">23,0°</button></form>
+ <form method="post" action="/setpoint"><input type="hidden" name="v" value="23.5">
+  <button class="{{ 'cur' if bor|string == '23.5' }}">23,5°</button></form>
+</div>
+<div class="card"><span>Bör-värde (mål rumstemperatur)</span>
+<form method="post" action="/setpoint">
+<input name="v" type="number" step="0.5" value="{{ bor }}" style="max-width:110px">
+<button>Spara</button></form></div>
 
 <h2>Vår styrning</h2>
-<div class="card"><span>Inject (fejkad utetemp)</span><span class="big">{{ inject }} °C</span></div>
-<div class="card"><span>Influence (vår Påverkan)</span><span class="big">{{ influence }} °C</span></div>
+<div class="card"><span>Inject (fejkad utetemp)</span>
+<span class="big" id="v-inject">{{ inject }} °C</span></div>
+<div class="card"><span>Influence (vår Påverkan)</span>
+<span class="big" id="v-influence">{{ influence }} °C</span></div>
 <div class="card"><span>Justera Påverkan (offset_c) direkt</span>
 <form method="post" action="/offset">
 <input name="v" type="number" step="0.5" value="{{ off }}" style="max-width:110px">
 <button>Spara</button></form></div>
-<div class="card"><span>Verklig utetemp (MQTT, annars prognos)</span><span class="big">{{ ute }} °C</span></div>
 {{ spark }}
 
 <h2>MQTT-ingångar</h2>
@@ -1128,10 +1251,6 @@ DASH_T = """
 
 <h2>Rumsreglering: är/bör</h2>
 <div class="card"><span>Är-värde (rumstemperatur)</span><span class="big">{{ ar }} °C</span></div>
-<div class="card"><span>Bör-värde (mål rumstemperatur)</span>
-<form method="post" action="/setpoint">
-<input name="v" type="number" step="0.5" value="{{ bor }}" style="max-width:110px">
-<button>Spara</button></form></div>
 <div class="card {{ 'ok' if auto_on else 'warn' }}">
 <span>Självlärande reglering {{ 'PÅ' if auto_on else 'AV' }}</span>
 <form method="post" action="/auto"><button>{{ 'Stäng av' if auto_on else 'Slå på' }}</button></form></div>
@@ -1228,15 +1347,18 @@ Influence = Inject − ute. Nollställda gains ger Inject = ute.</p>
 """
 
 
-def render(body_t, dash=False, **ctx):
+def render(body_t, dash=False, active="hem", **ctx):
     # autoescape=True: MQTT-payloads, topic-namn, söksträngar m.m. escapes
     # automatiskt (trasiga payloads kan inte sönder layouten). Betrodd
     # intern HTML (spark/forecast/learn_table/pager/role_opts/diag) skickas
     # in inslagen i Markup(...) av anroparen - se länkarna nedan.
     env = Environment(autoescape=True)
     body = env.from_string(body_t).render(**ctx)
+    with _lock:
+        mqtt_ok = bool(ctx.get("mqtt_ok", _state["mqtt_connected"]))
     return HTMLResponse(env.from_string(BASE_T).render(
-        css=CSS, body=Markup(body), dash=dash))
+        css=CSS, body=Markup(body), dash=dash, active=active,
+        mqtt_ok=mqtt_ok))
 
 
 def fmt_age(ts):
@@ -1285,8 +1407,8 @@ def spark_svg():
                f'<polyline fill="none" stroke="{color}" stroke-width="2" '
                f'points="{coords}"/></svg>')
         return f"{lo:.1f}..{hi:.1f} °C (24 h)", svg
-    rng_i, svg_i = path_for("inject_c", "#8ab4e8")
-    rng_f, svg_f = path_for("influence_c", "#e8c98a")
+    rng_i, svg_i = path_for("inject_c", "#7ab8f5")
+    rng_f, svg_f = path_for("influence_c", "#f5c518")
     html = ""
     if svg_i:
         html += (f'<div class="card"><span>Inject 24 h&nbsp;'
@@ -1326,7 +1448,7 @@ def dashboard():
                           for i, (_, v) in enumerate(series))
         forecast_svg = ('<div class="card"><span>Prognos 12 h</span>'
                         '<svg width="600" height="44" style="margin-top:6px">'
-                        '<polyline fill="none" stroke="#8ab4e8" stroke-width="2"'
+                        '<polyline fill="none" stroke="#7ab8f5" stroke-width="2"'
                         f' points="{coords}"/></svg></div>')
 
     a = CONFIG["auto"]
@@ -1357,7 +1479,7 @@ def dashboard():
                            if lg.get("pw_tap") else '')
                         + '.</p>')
 
-    return render(DASH_T, dash=True,
+    return render(DASH_T, dash=True, active="hem",
         mqtt_ok=_state["mqtt_connected"],
         host=CONFIG["mqtt"]["host"] or "-",
         place=CONFIG["location"].get("place") or "-",
@@ -1384,6 +1506,45 @@ def dashboard():
         auto_on=(a.get("enabled") == "on"), learn_table=Markup(learn_table))
 
 
+# --------------------------------------------------------------- v0.20 webb
+# Statiska filer (PWA-manifest, service worker, ikoner, hero-bild). Namnet
+# vitlistas: inga sökvägar, inga punkter, kända filändelser -> inget
+# path-traversal och inget slumpinnehåll från disken.
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+_STATIC_TYPES = {".svg": "image/svg+xml", ".png": "image/png",
+                 ".js": "text/javascript", ".webmanifest":
+                 "application/manifest+json", ".css": "text/css"}
+
+
+@app.get("/static/{fname}")
+def static_file(fname: str):
+    p = Path(fname)
+    if (p.name != fname or not p.suffix
+            or p.suffix.lower() not in _STATIC_TYPES
+            or not (_STATIC_DIR / p.name).is_file()):
+        return HTMLResponse("finns inte", status_code=404)
+    return FileResponse(_STATIC_DIR / p.name,
+                        media_type=_STATIC_TYPES[p.suffix.lower()])
+
+
+@app.get("/api/state")
+def api_state():
+    """Live-värden för app.js tyst pollning (ingen sidomladdning)."""
+    w = _state["weather"] or {}
+    rec = _state["samples"].get("indoor_temp_c")
+    return JSONResponse({
+        "ar": f"{rec['value']:.1f}" if rec else "-",
+        "bor": CONFIG["auto"]["setpoint_c"],
+        "ute": current_ute(),
+        "inject": _state["inject_c"], "influence": _state["influence_c"],
+        "mode": CONFIG["injector"]["mode"],
+        "mqtt_ok": bool(_state["mqtt_connected"]),
+        "last_weather": (f"senast {fmt_age(_state['last_weather_ok'])}"
+                         if _state["last_weather_ok"]
+                         else "väntar på svar"),
+    })
+
+
 @app.get("/setup", response_class=HTMLResponse)
 def setup_get():
     with _lock:
@@ -1398,7 +1559,7 @@ def setup_get():
     seen_rows = [{"topic": t, "payload": _disp(d),
                   "age": fmt_age(d["ts"])} for t, d in seen[:12]]
     ex = CONFIG["mqtt"].get("explorer", "on")
-    return render(SETUP_T, cfg=CONFIG, roles=ROLES,
+    return render(SETUP_T, active="installningar", cfg=CONFIG, roles=ROLES,
                   place=CONFIG["location"].get("place") or "inte valt",
                   seen_rows=seen_rows, n_seen=len(seen),
                   ex1="selected" if ex != "off" else "",
@@ -1513,7 +1674,7 @@ def topics(q: str = "", showall: str = "", page: int = 1):
     else:
         pager = ""
     role_opts = "".join(f'<option value="{r}">{r}</option>' for r in ROLES)
-    return render(TOPICS_T, rows=rows, q=q or "",
+    return render(TOPICS_T, active="topics", rows=rows, q=q or "",
                   role_opts=Markup(role_opts),
                   allsel="checked" if showall else "",
                   n=len(rows), total=len(all_rows),
@@ -1553,7 +1714,7 @@ def geo_search(q: str = ""):
              "tz": g.get("timezone") or "",
              "name_url": urllib.parse.quote(g["name"])}
             for g in results]
-    return render(GEO_T, q=q, hits=hits)
+    return render(GEO_T, active="installningar", q=q, hits=hits)
 
 
 @app.get("/geo/set")
@@ -1616,7 +1777,7 @@ async def setup_post(request: Request):
 @app.get("/tuning", response_class=HTMLResponse)
 def tune_get():
     i = CONFIG["injector"]
-    return render(TUNE_T, i=i,
+    return render(TUNE_T, active="styrning", i=i,
                   sel="selected" if i["mode"] == "shadow" else "",
                   sel2="selected" if i["mode"] == "active" else "",
                   p1="selected" if CONFIG["publish"]["inject"] == "on" else "",
