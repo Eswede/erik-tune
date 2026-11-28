@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#131318"/>
+      <stop offset=".55" stop-color="#23232b"/>
+      <stop offset="1" stop-color="#2b2b33"/>
+    </linearGradient>
+    <radialGradient id="sun" cx=".5" cy=".62" r=".55">
+      <stop offset="0" stop-color="#f5c518" stop-opacity=".55"/>
+      <stop offset=".35" stop-color="#f5c518" stop-opacity=".18"/>
+      <stop offset="1" stop-color="#f5c518" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="fog" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#b9bcc4" stop-opacity="0"/>
+      <stop offset="1" stop-color="#b9bcc4" stop-opacity=".16"/>
+    </linearGradient>
+    <linearGradient id="fog2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9aa0ab" stop-opacity=".14"/>
+      <stop offset="1" stop-color="#9aa0ab" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="800" height="450" fill="url(#sky)"/>
+  <rect width="800" height="450" fill="url(#sun)"/>
+  <circle cx="400" cy="290" r="46" fill="#f5c518" opacity=".35"/>
+
+  <!-- fjarran skogsrad (ljusast, mest dimma) -->
+  <path opacity=".55" fill="#3a3a44" d="M0 330 L26 296 L44 318 L64 278 L84 314 L106 284 L124 316
+    L148 272 L170 312 L192 286 L212 320 L236 280 L258 316 L280 288 L302 322 L326 284
+    L348 318 L372 282 L394 320 L418 286 L440 318 L464 278 L486 316 L510 286 L532 320
+    L556 282 L578 316 L602 286 L624 320 L648 280 L670 314 L694 286 L716 318 L740 278
+    L762 314 L782 292 L800 318 L800 450 L0 450 Z"/>
+  <rect y="290" width="800" height="70" fill="url(#fog)"/>
+
+  <!-- mellanskikt -->
+  <path opacity=".85" fill="#232329" d="M0 372 L30 330 L52 360 L78 318 L102 356 L128 326 L150 360
+    L176 312 L200 356 L226 322 L250 360 L274 316 L298 356 L324 324 L348 362 L372 314
+    L396 358 L420 326 L444 362 L468 312 L492 358 L516 322 L540 360 L564 316 L588 358
+    L612 324 L636 362 L660 314 L684 356 L708 322 L732 360 L756 316 L778 356 L800 332
+    L800 450 L0 450 Z"/>
+  <rect y="340" width="800" height="70" fill="url(#fog2)"/>
+
+  <!-- nara skogsrad (morkast) -->
+  <path fill="#101014" d="M0 420 L36 356 L58 404 L86 344 L112 402 L140 352 L164 404 L192 338
+    L218 402 L244 350 L270 404 L296 342 L322 402 L348 352 L374 404 L400 340 L426 402
+    L452 350 L478 404 L504 342 L530 402 L556 352 L582 404 L608 340 L634 402 L660 350
+    L686 404 L712 342 L738 402 L764 352 L788 406 L800 382 L800 450 L0 450 Z"/>
+  <rect y="400" width="800" height="50" fill="url(#fog)"/>
+</svg>

@@ -134,10 +134,23 @@ def _seed_modules():
                 self.headers = {"location": url}
                 self.status_code = status_code
 
+        class _FileResponse:
+            def __init__(self, filename, media_type=None):
+                self.filename = filename          # fildelaren i teststubben
+                self.media_type = media_type
+
+        class _JSONResponse:
+            def __init__(self, content=None, status_code=200):
+                self.content = content            # dict, oserialiserad
+                self.body = json.dumps(content).encode()
+                self.status_code = status_code
+
         m = mod("fastapi", FastAPI=_FastAPIStub, Request=_RequestStub)
         m.responses = mod("fastapi.responses",
                           HTMLResponse=_HTMLResponse,
-                          RedirectResponse=_RedirectResponse)
+                          RedirectResponse=_RedirectResponse,
+                          JSONResponse=_JSONResponse,
+                          FileResponse=_FileResponse)
         mod("uvicorn", run=lambda **kw: None)
         mod("requests", get=_requests_get)
         paho = mod("paho")
@@ -862,6 +875,57 @@ def test_discovery_includes_givare_v019():
     assert len(cfgs) == 13
     assert sum(1 for t, _ in PUBLISHED
                if t.startswith("homeassistant/number/")) == 2
+
+
+# ---------------------------------------------------------------------------
+# v0.20: webbgränssnitt - PWA-skal, statiska filer, API, mobil dashboard
+# ---------------------------------------------------------------------------
+
+def test_webapp_shell_pwa_meta_v020():
+    html = app.render("<p>x</p>", active="hem").content
+    assert 'rel="manifest"' in html and "/static/manifest.webmanifest" in html
+    assert 'name="theme-color"' in html
+    assert 'apple-touch-icon' in html
+    assert 'nav class="bottom"' in html                   # app-balk
+    assert html.count('href="/tuning"') >= 1
+    # ingen 30-s-meta-refresh och inget inline-JS längre (app.js är extern)
+    assert 'http-equiv="refresh"' not in html
+    assert "<script>" not in html
+
+
+def test_webapp_dashboard_mobile_v020():
+    app.CONFIG["mqtt"]["host"] = "broker.test"
+    html = app.dashboard().content
+    assert "/static/hero.svg" in html                     # hero-bakgrund
+    assert 'id="v-ar"' in html and 'id="v-ute"' in html   # live-hooks
+    assert "Innegivare" in html and "Utomhus" in html
+    assert "Ställ in temperatur" in html
+    for v in ("22.5", "23.0", "23.5"):                   # snabbknappar
+        assert f'value="{v}"' in html
+    assert "/static/app.js" in html                       # tyst pollning
+
+
+def test_webapp_static_files_v020():
+    r = app.static_file("manifest.webmanifest")
+    assert r.filename.name == "manifest.webmanifest"
+    assert r.media_type == "application/manifest+json"
+    assert '"name": "Erik Tune"' in r.filename.read_text(encoding="utf-8")
+    for f in ("hero.svg", "sw.js", "app.js", "icon-192.png", "icon-512.png"):
+        assert (app._STATIC_DIR / f).is_file(), f
+    assert app.static_file("hero.svg").media_type == "image/svg+xml"
+    # path-traversal och okända filer stängs ute
+    assert app.static_file("../app.py").status_code == 404
+    assert app.static_file("saknas.png").status_code == 404
+    assert app.static_file("app.py").status_code == 404   # ändelse ej vitlistad
+
+
+def test_webapp_api_state_v020():
+    d = app.api_state().content
+    for k in ("ar", "bor", "ute", "inject", "influence", "mode",
+              "mqtt_ok", "last_weather"):
+        assert k in d, k
+    assert d["bor"] == app.CONFIG["auto"]["setpoint_c"]
+    assert d["mode"] == app.CONFIG["injector"]["mode"]
 
 
 # ---------------------------------------------------------------------------
