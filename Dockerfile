@@ -3,6 +3,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
+COPY static ./static
 RUN useradd --system --no-create-home erik \
     && mkdir /data && chown erik:erik /data
 USER erik
